@@ -26,6 +26,8 @@ Status legend:
 | Pub/Sub | push delivery to Functions emulator | unknown | Needs event flow capture. |
 | Storage | JSON/XML object upload/download/list/delete | planned | Defer full Firebase Security Rules fidelity. |
 | Storage | Functions object events | unknown | Needs event flow capture. |
-| Functions | Official emulator integration | planned | Per-checkout process manager first. |
-| Functions | Native Rust worker orchestration | planned | Long-term fast reload path. |
+| Functions | HTTP/callable export discovery and proxying | implemented | `firelite functions` starts a checkout-local Node worker, reads gen1/gen2 metadata, and serves `/{project}/{region}/{function}` URLs. |
+| Functions | File-watch reload | implemented | Polls watched source files, restarts the Node worker, and swaps the active registry after successful rediscovery. |
+| Functions | Background event dispatch | planned | Auth/Pub/Sub/Tasks/Storage triggers can be registered by discovery but are not dispatched yet. |
+| Functions | Native Rust worker orchestration | planned | Long-term fast reload path if Node process startup becomes the bottleneck. |
 | Emulator Hub | locator metadata endpoints | unknown | Discovery harness should capture hub endpoints expected by SDKs/tools. |

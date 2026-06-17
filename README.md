@@ -8,6 +8,7 @@ It is not a Firebase product and does not try to clone production Firebase. The 
 
 - Rust workspace and `firelite` CLI.
 - Minimal Auth emulator state namespaced by Firebase project ID.
+- Checkout-local Cloud Functions supervisor with Node handler discovery and reload.
 - Contract fixtures for basic Auth create, sign-in, list, and delete flows.
 - Compatibility harness scaffolding for running official Firebase emulators and SDK probes.
 - Architecture and compatibility notes in `docs/`.
@@ -39,7 +40,7 @@ curl -s 'http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signUp
 firelite daemon
 firelite attach --project demo-myrepo-agent-17 --workdir ./checkout-17
 firelite reset --project demo-myrepo-agent-17
-firelite functions --project demo-myrepo-agent-17 --watch ./functions
+firelite functions --project demo-myrepo-agent-17 --watch ./functions --port 5001
 ```
 
-Only `daemon` and Auth reset via the HTTP admin API are functional in this first cut. `attach`, `reset`, and `functions` are present to lock the UX surface and will be wired to the daemon control plane in later milestones.
+`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. `attach` and `reset` are still present to lock the UX surface and will be wired to the daemon control plane in later milestones.

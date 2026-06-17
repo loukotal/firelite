@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use firelite::{config::DaemonConfig, server};
+use firelite::{config::DaemonConfig, functions::FunctionsConfig, server};
 use std::{net::SocketAddr, path::PathBuf};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -37,6 +37,10 @@ enum Command {
     Functions {
         #[arg(long)]
         project: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 5001)]
+        port: u16,
         #[arg(long)]
         watch: PathBuf,
     },
@@ -64,12 +68,21 @@ async fn main() -> anyhow::Result<()> {
             println!("reset is scaffolded: project={project}");
             Ok(())
         }
-        Command::Functions { project, watch } => {
-            println!(
-                "functions is scaffolded: project={project} watch={}",
-                watch.display()
-            );
-            Ok(())
+        Command::Functions {
+            project,
+            host,
+            port,
+            watch,
+        } => {
+            let addr: SocketAddr = format!("{host}:{port}")
+                .parse()
+                .with_context(|| format!("invalid functions address {host}:{port}"))?;
+            firelite::functions::serve(FunctionsConfig {
+                project_id: project,
+                source_dir: watch,
+                addr,
+            })
+            .await
         }
     }
 }

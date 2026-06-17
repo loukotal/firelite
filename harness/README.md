@@ -42,3 +42,13 @@ The harness should:
 - Auth list users through Admin SDK.
 - Auth delete user.
 - Auth reset/import/export endpoints.
+
+## SDK E2E
+
+Run Firelite against the real Firebase Web Auth SDK:
+
+```sh
+npm run test:auth-sdk
+```
+
+This starts `cargo run -p firelite -- daemon` on a temporary loopback port, calls `connectAuthEmulator`, and verifies password, custom-token, and email-link sign-in flows through `firebase/auth`.

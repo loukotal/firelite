@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "discover:auth": "node src/discover-auth.mjs"
+    "discover:auth": "node src/discover-auth.mjs",
+    "test:auth-sdk": "node src/test-auth-sdk.mjs"
   },
   "dependencies": {
     "firebase": "^11.0.0",

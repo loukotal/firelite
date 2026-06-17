@@ -13,9 +13,13 @@ Status legend:
 | Auth | `accounts:signInWithPassword` | implemented | Password hash is local-only and not production-compatible. |
 | Auth | `accounts:lookup` by ID token/local ID | implemented | Unsigned local JWT-like token, sufficient for local contract flow. |
 | Auth | `accounts:delete` | implemented | Supports `localId` or `idToken`. |
+| Auth | `accounts:signInWithCustomToken` | implemented | Accepts local unsigned JWT-like tokens or plain local IDs; official fixture capture still needed. |
+| Auth | `accounts:signInWithIdp` | implemented | Tolerant provider/raw ID/email flow for Google/OAuth popup paths; official fixture capture still needed. |
+| Auth | `accounts:sendOobCode` / `accounts:signInWithEmailLink` | implemented | In-memory single-use email-link OOB codes. |
+| Auth | `/emulator/v1/projects/{project}/oobCodes` | implemented | Local inspection endpoint for email-link tests/debugging. |
 | Auth | `/emulator/v1/projects/{project}/accounts` list/reset | implemented | Used for test isolation and fixture comparison. |
 | Auth | import/export | planned | Needed for parity with Emulator Suite workflows. |
-| Auth | custom tokens, providers, MFA, OOB flows | planned | Add only when real local tests require them. |
+| Auth | MFA and deeper provider/OOB parity | planned | Tracked in `docs/auth-emulator-api-surface.md`; add only when real local tests require them. |
 | Cloud Tasks | REST create/list/delete/lease task flows | planned | Next bounded target after Auth fixtures. |
 | Cloud Tasks | Functions task queue dispatch | unknown | Needs official emulator event capture. |
 | Pub/Sub | topic/subscription CRUD and publish/pull | planned | Implement SDK-compatible subset before full behavior. |

@@ -25,7 +25,8 @@ Status legend:
 | Cloud Tasks | Functions task queue dispatch | unknown | Needs official emulator event capture. |
 | Pub/Sub | topic/subscription CRUD and publish/pull | planned | Implement SDK-compatible subset before full behavior. |
 | Pub/Sub | push delivery to Functions emulator | unknown | Needs event flow capture. |
-| Storage | JSON/XML object upload/download/list/delete | planned | Defer full Firebase Security Rules fidelity. |
+| Storage | JSON API media upload/download/list/delete | implemented | In-memory object state with `/upload/storage/v1`, `/storage/v1`, and Firebase `/v0` object paths. Defer XML API, resumable uploads, and full Firebase Security Rules fidelity. |
+| Storage | Emulator bucket object inspection/reset | implemented | `/emulator/v1/projects/{project}/storage/buckets/{bucket}/objects` supports list/reset for local tests. |
 | Storage | Functions object events | unknown | Needs event flow capture. |
 | Functions | HTTP/callable export discovery and proxying | implemented | `firelite functions` starts a checkout-local Node worker, reads gen1/gen2 metadata, and serves `/{project}/{region}/{function}` URLs. |
 | Functions | File-watch reload | implemented | Polls watched source files, restarts the Node worker, and swaps the active registry after successful rediscovery. |

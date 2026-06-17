@@ -1,4 +1,4 @@
-use crate::{auth, config::DaemonConfig};
+use crate::{auth, config::DaemonConfig, storage, web_ui};
 use anyhow::Context;
 use axum::{routing::get, Router};
 use std::sync::Arc;
@@ -8,17 +8,21 @@ use tracing::info;
 #[derive(Clone)]
 pub struct AppState {
     pub auth: auth::AuthState,
+    pub storage: storage::StorageState,
 }
 
 pub fn app() -> Router {
     let state = Arc::new(AppState {
         auth: auth::AuthState::default(),
+        storage: storage::StorageState::default(),
     });
 
     Router::new()
         .route("/", get(root))
         .route("/__/health", get(health))
+        .route("/__/ui", get(web_ui::console))
         .merge(auth::router())
+        .merge(storage::router())
         .with_state(state)
 }
 

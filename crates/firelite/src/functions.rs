@@ -29,6 +29,7 @@ pub struct FunctionsConfig {
     pub project_id: String,
     pub source_dir: PathBuf,
     pub addr: SocketAddr,
+    pub build_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +114,7 @@ pub async fn serve(config: FunctionsConfig) -> anyhow::Result<()> {
     tokio::spawn(supervise_workers(
         config.project_id.clone(),
         config.source_dir.clone(),
+        config.build_command.clone(),
         state.active.clone(),
         reload_rx,
     ));
@@ -281,6 +283,7 @@ fn parse_function_route(path: &str) -> Option<ParsedRoute> {
 async fn supervise_workers(
     project_id: String,
     source_dir: PathBuf,
+    build_command: Option<String>,
     active: Arc<RwLock<Option<ActiveWorker>>>,
     mut reload_rx: mpsc::Receiver<()>,
 ) {
@@ -290,6 +293,13 @@ async fn supervise_workers(
     while reload_rx.recv().await.is_some() {
         while reload_rx.try_recv().is_ok() {}
         generation += 1;
+
+        if let Err(error) =
+            run_build_command(build_command.as_deref(), &source_dir, generation).await
+        {
+            error!(%error, generation, "failed to build functions source");
+            continue;
+        }
 
         match start_worker(&project_id, &source_dir, generation).await {
             Ok(started) => {
@@ -318,6 +328,49 @@ async fn supervise_workers(
             }
         }
     }
+}
+
+async fn run_build_command(
+    build_command: Option<&str>,
+    source_dir: &Path,
+    generation: u64,
+) -> anyhow::Result<()> {
+    let Some(build_command) = build_command else {
+        return Ok(());
+    };
+
+    info!(generation, command = %build_command, "building functions source");
+    let output = Command::new("sh")
+        .arg("-lc")
+        .arg(build_command)
+        .current_dir(source_dir)
+        .output()
+        .await
+        .with_context(|| format!("failed to run build command `{build_command}`"))?;
+
+    if !output.stdout.is_empty() {
+        info!(
+            generation,
+            output = %String::from_utf8_lossy(&output.stdout),
+            "functions build stdout"
+        );
+    }
+    if !output.stderr.is_empty() {
+        warn!(
+            generation,
+            output = %String::from_utf8_lossy(&output.stderr),
+            "functions build stderr"
+        );
+    }
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "build command `{build_command}` exited with {}",
+            output.status
+        ));
+    }
+
+    Ok(())
 }
 
 async fn start_worker(
@@ -462,7 +515,7 @@ fn should_ignore_dir(path: &Path) -> bool {
 fn should_watch_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
-        Some("js" | "cjs" | "mjs" | "json")
+        Some("js" | "cjs" | "mjs" | "json" | "ts" | "tsx")
     )
 }
 
@@ -683,6 +736,41 @@ exports.cleanup.__schedule = {
         assert!(!worker.active.http_functions.contains_key(&FunctionKey {
             region: "us-central1".to_string(),
             name: "cleanup".to_string(),
+        }));
+        worker.child.kill().await.unwrap();
+    }
+
+    #[test]
+    fn watches_typescript_inputs() {
+        assert!(should_watch_file(Path::new("index.ts")));
+        assert!(should_watch_file(Path::new("src/index.tsx")));
+        assert!(should_watch_file(Path::new("lib/index.js")));
+    }
+
+    #[tokio::test]
+    async fn build_command_can_generate_loadable_javascript() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir.join("index.ts"), "// pretend TypeScript source\n");
+
+        run_build_command(
+            Some(
+                r#"printf '%s\n' 'exports.api = (req, res) => res.end("built");' 'exports.api.__trigger = { name: "api", regions: ["us-central1"], httpsTrigger: {} };' > index.js"#,
+            ),
+            &dir,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
+        assert!(worker.active.http_functions.contains_key(&FunctionKey {
+            region: "us-central1".to_string(),
+            name: "api".to_string(),
         }));
         worker.child.kill().await.unwrap();
     }

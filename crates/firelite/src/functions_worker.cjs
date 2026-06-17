@@ -3,9 +3,14 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 const sourceDir = process.argv[2];
 const projectId = process.argv[3] || "demo-firelite";
+const writeProtocol = process.stdout.write.bind(process.stdout);
+const writeUserStdout = process.stderr.write.bind(process.stderr);
+
+process.stdout.write = writeUserStdout;
 
 if (!sourceDir) {
   fail("missing functions source directory");
@@ -20,7 +25,7 @@ main().catch((error) => fail(error && error.stack ? error.stack : String(error))
 
 async function main() {
   const entrypoint = resolveEntrypoint(sourceDir);
-  const loaded = require(entrypoint);
+  const loaded = await loadEntrypoint(entrypoint, sourceDir);
   const functions = discoverFunctions(loaded);
   const handlers = new Map();
 
@@ -78,6 +83,32 @@ async function main() {
       functions,
     });
   });
+}
+
+async function loadEntrypoint(entrypoint, source) {
+  if (isEsmEntrypoint(entrypoint, source)) {
+    return import(pathToFileURL(entrypoint).href);
+  }
+
+  return require(entrypoint);
+}
+
+function isEsmEntrypoint(entrypoint, source) {
+  const extension = path.extname(entrypoint);
+  if (extension === ".mjs") {
+    return true;
+  }
+  if (extension === ".cjs") {
+    return false;
+  }
+
+  const packageJsonPath = path.join(source, "package.json");
+  if (!fs.existsSync(packageJsonPath)) {
+    return false;
+  }
+
+  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+  return packageJson.type === "module";
 }
 
 function resolveEntrypoint(source) {
@@ -267,7 +298,7 @@ function getExport(rootExports, entryId) {
 }
 
 function write(payload) {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  writeProtocol(`${JSON.stringify(payload)}\n`);
 }
 
 function fail(message) {

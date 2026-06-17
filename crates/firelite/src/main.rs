@@ -43,6 +43,9 @@ enum Command {
         port: u16,
         #[arg(long)]
         watch: PathBuf,
+        /// Command to run in the watched functions directory before loading/reloading workers.
+        #[arg(long)]
+        build_command: Option<String>,
     },
 }
 
@@ -73,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
             host,
             port,
             watch,
+            build_command,
         } => {
             let addr: SocketAddr = format!("{host}:{port}")
                 .parse()
@@ -81,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
                 project_id: project,
                 source_dir: watch,
                 addr,
+                build_command,
             })
             .await
         }

@@ -41,6 +41,7 @@ firelite daemon
 firelite attach --project demo-myrepo-agent-17 --workdir ./checkout-17
 firelite reset --project demo-myrepo-agent-17
 firelite functions --project demo-myrepo-agent-17 --watch ./functions --port 5001
+firelite functions --project demo-myrepo-agent-17 --watch ./functions --build-command 'npm run build'
 ```
 
-`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. `attach` and `reset` are still present to lock the UX surface and will be wired to the daemon control plane in later milestones.
+`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. For TypeScript functions, pass the same SWC/tsc build command the Firebase emulator expects; Firelite runs it before the initial load and before each reload. `attach` and `reset` are still present to lock the UX surface and will be wired to the daemon control plane in later milestones.

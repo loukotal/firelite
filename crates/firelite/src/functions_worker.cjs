@@ -133,7 +133,7 @@ function describeFunction(entryId, value) {
   }
 
   if (value.__trigger) {
-    return describeGen1(entryId, value.__trigger);
+    return describeGen1(entryId, value.__trigger, value);
   }
 
   if (value.__endpoint) {
@@ -143,9 +143,25 @@ function describeFunction(entryId, value) {
   return null;
 }
 
-function describeGen1(entryId, trigger) {
+function describeGen1(entryId, trigger, value) {
   const name = trigger.name || entryId;
   const regions = trigger.regions || [trigger.region || "us-central1"];
+  const schedule = value.__schedule || trigger.scheduleTrigger;
+
+  if (schedule) {
+    return {
+      entryId,
+      name,
+      region: regions[0],
+      trigger: {
+        type: "schedule",
+        schedule: schedule.schedule || schedule,
+        timeZone: schedule.timeZone || schedule.time_zone || null,
+        retryConfig: schedule.retryConfig || schedule.retry_config || null,
+        topic: trigger.eventTrigger ? trigger.eventTrigger.resource || null : null,
+      },
+    };
+  }
 
   if (trigger.httpsTrigger) {
     return {
@@ -164,6 +180,27 @@ function describeGen1(entryId, trigger) {
   }
 
   if (trigger.eventTrigger) {
+    const resource = trigger.eventTrigger.resource || null;
+    if (
+      value.__schedule ||
+      (trigger.eventTrigger.eventType === "google.pubsub.topic.publish" &&
+        typeof resource === "string" &&
+        resource.includes("/topics/firebase-schedule-"))
+    ) {
+      return {
+        entryId,
+        name,
+        region: regions[0],
+        trigger: {
+          type: "schedule",
+          schedule: value.__schedule ? value.__schedule.schedule || value.__schedule : null,
+          timeZone: value.__schedule ? value.__schedule.timeZone || value.__schedule.time_zone || null : null,
+          retryConfig: value.__schedule ? value.__schedule.retryConfig || value.__schedule.retry_config || null : null,
+          topic: resource,
+        },
+      };
+    }
+
     return {
       entryId,
       name,
@@ -182,6 +219,20 @@ function describeGen1(entryId, trigger) {
 function describeGen2(entryId, endpoint) {
   const name = endpoint.id || endpoint.name || entryId;
   const region = Array.isArray(endpoint.region) ? endpoint.region[0] : endpoint.region || "us-central1";
+
+  if (endpoint.scheduleTrigger) {
+    return {
+      entryId,
+      name,
+      region,
+      trigger: {
+        type: "schedule",
+        schedule: endpoint.scheduleTrigger.schedule || endpoint.scheduleTrigger,
+        timeZone: endpoint.scheduleTrigger.timeZone || endpoint.scheduleTrigger.time_zone || null,
+        retryConfig: endpoint.scheduleTrigger.retryConfig || endpoint.scheduleTrigger.retry_config || null,
+      },
+    };
+  }
 
   if (endpoint.httpsTrigger || endpoint.callableTrigger) {
     return {

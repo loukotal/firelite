@@ -42,7 +42,8 @@ struct FunctionsState {
 struct ActiveWorker {
     generation: u64,
     base_url: String,
-    functions: HashMap<FunctionKey, FunctionDescriptor>,
+    functions: Vec<FunctionDescriptor>,
+    http_functions: HashMap<FunctionKey, FunctionDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -65,6 +66,14 @@ pub struct FunctionDescriptor {
 pub enum TriggerKind {
     Https {
         callable: bool,
+    },
+    Schedule {
+        schedule: Option<serde_json::Value>,
+        #[serde(rename = "timeZone")]
+        time_zone: Option<String>,
+        #[serde(rename = "retryConfig")]
+        retry_config: Option<serde_json::Value>,
+        topic: Option<String>,
     },
     Event {
         event_type: Option<String>,
@@ -177,7 +186,7 @@ async fn proxy_request_inner(
         name: route.name,
     };
     let descriptor = active
-        .functions
+        .http_functions
         .get(&key)
         .cloned()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "function not found").into_response())?;
@@ -286,12 +295,13 @@ async fn supervise_workers(
             Ok(started) => {
                 let names = started
                     .active
-                    .functions
+                    .http_functions
                     .keys()
                     .map(|key| format!("{}/{}", key.region, key.name))
                     .collect::<Vec<_>>();
                 info!(
                     generation,
+                    registered_functions = started.active.functions.len(),
                     functions = ?names,
                     "loaded functions worker"
                 );
@@ -348,7 +358,9 @@ async fn start_worker(
         WorkerMessage::Ready { port, functions } => (port, functions),
         WorkerMessage::Error { message } => return Err(anyhow!(message)),
     };
-    let functions = descriptors
+    let http_functions = descriptors
+        .iter()
+        .cloned()
         .into_iter()
         .filter(|descriptor| matches!(descriptor.trigger, TriggerKind::Https { .. }))
         .map(|descriptor| {
@@ -367,7 +379,8 @@ async fn start_worker(
         active: ActiveWorker {
             generation,
             base_url: format!("http://127.0.0.1:{port}"),
-            functions,
+            functions: descriptors,
+            http_functions,
         },
     })
 }
@@ -525,9 +538,151 @@ exports.api.__trigger = {
         );
 
         let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
-        assert!(worker.active.functions.contains_key(&FunctionKey {
+        assert!(worker.active.http_functions.contains_key(&FunctionKey {
             region: "us-central1".to_string(),
             name: "api".to_string(),
+        }));
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxies_get_and_post_requests_to_http_function() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+exports.api = (req, res) => {
+  let body = "";
+  req.on("data", chunk => body += chunk);
+  req.on("end", () => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({
+      method: req.method,
+      url: req.url,
+      body,
+      header: req.headers["x-firelite-test"] || null
+    }));
+  });
+};
+exports.api.__trigger = {
+  name: "api",
+  regions: ["us-central1"],
+  httpsTrigger: {}
+};
+"#,
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
+        let state = Arc::new(FunctionsState {
+            project_id: "demo-firelite".to_string(),
+            active: Arc::new(RwLock::new(Some(worker.active.clone()))),
+            client: reqwest::Client::new(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let got: serde_json::Value = client
+            .get(format!(
+                "{base_url}/demo-firelite/us-central1/api/users/1?debug=true"
+            ))
+            .header("x-firelite-test", "get-header")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(got["method"], "GET");
+        assert_eq!(got["url"], "/users/1?debug=true");
+        assert_eq!(got["header"], "get-header");
+
+        let posted: serde_json::Value = client
+            .post(format!("{base_url}/demo-firelite/us-central1/api"))
+            .header("x-firelite-test", "post-header")
+            .body(r#"{"ok":true}"#)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(posted["method"], "POST");
+        assert_eq!(posted["url"], "/");
+        assert_eq!(posted["body"], r#"{"ok":true}"#);
+        assert_eq!(posted["header"], "post-header");
+
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovers_scheduled_functions_without_routing_them_as_http() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+exports.cleanup = () => {};
+exports.cleanup.__trigger = {
+  name: "cleanup",
+  regions: ["us-central1"],
+  eventTrigger: {
+    eventType: "google.pubsub.topic.publish",
+    resource: "projects/demo-firelite/topics/firebase-schedule-cleanup-us-central1"
+  }
+};
+exports.cleanup.__schedule = {
+  schedule: "every 5 minutes",
+  timeZone: "UTC"
+};
+"#,
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
+        let scheduled = worker
+            .active
+            .functions
+            .iter()
+            .find(|descriptor| descriptor.name == "cleanup")
+            .unwrap();
+        match &scheduled.trigger {
+            TriggerKind::Schedule {
+                schedule,
+                time_zone,
+                topic,
+                ..
+            } => {
+                assert_eq!(
+                    schedule.as_ref().and_then(|value| value.as_str()),
+                    Some("every 5 minutes")
+                );
+                assert_eq!(time_zone.as_deref(), Some("UTC"));
+                assert_eq!(
+                    topic.as_deref(),
+                    Some("projects/demo-firelite/topics/firebase-schedule-cleanup-us-central1")
+                );
+            }
+            other => panic!("expected schedule trigger, got {other:?}"),
+        }
+        assert!(!worker.active.http_functions.contains_key(&FunctionKey {
+            region: "us-central1".to_string(),
+            name: "cleanup".to_string(),
         }));
         worker.child.kill().await.unwrap();
     }

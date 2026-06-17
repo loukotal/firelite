@@ -22,7 +22,7 @@ use tokio::{
     sync::{mpsc, RwLock},
     time::{sleep, Duration},
 };
-use tracing::{error, info, warn};
+use tracing::{error, event, info, warn, Level};
 
 #[derive(Debug, Clone)]
 pub struct FunctionsConfig {
@@ -443,14 +443,136 @@ async fn log_worker_stdout(
     generation: u64,
 ) {
     while let Ok(Some(line)) = lines.next_line().await {
-        info!(generation, worker = "stdout", message = %line);
+        log_worker_line("stdout", generation, &line, Level::INFO);
     }
 }
 
 async fn log_worker_stderr(stderr: tokio::process::ChildStderr, generation: u64) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        warn!(generation, worker = "stderr", message = %line);
+        log_worker_line("stderr", generation, &line, Level::WARN);
+    }
+}
+
+fn log_worker_line(source: &'static str, generation: u64, line: &str, fallback_level: Level) {
+    let formatted = format_worker_log_line(line, fallback_level);
+
+    match formatted.level {
+        Level::ERROR => event!(
+            Level::ERROR,
+            generation,
+            worker = source,
+            "{}",
+            formatted.message
+        ),
+        Level::WARN => event!(
+            Level::WARN,
+            generation,
+            worker = source,
+            "{}",
+            formatted.message
+        ),
+        Level::INFO => event!(
+            Level::INFO,
+            generation,
+            worker = source,
+            "{}",
+            formatted.message
+        ),
+        Level::DEBUG => event!(
+            Level::DEBUG,
+            generation,
+            worker = source,
+            "{}",
+            formatted.message
+        ),
+        Level::TRACE => event!(
+            Level::TRACE,
+            generation,
+            worker = source,
+            "{}",
+            formatted.message
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FormattedWorkerLog {
+    level: Level,
+    message: String,
+}
+
+fn format_worker_log_line(line: &str, fallback_level: Level) -> FormattedWorkerLog {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(line)
+    else {
+        return FormattedWorkerLog {
+            level: fallback_level,
+            message: line.to_string(),
+        };
+    };
+
+    let level = object
+        .get("severity")
+        .and_then(|value| value.as_str())
+        .and_then(level_from_severity)
+        .unwrap_or(fallback_level);
+
+    let mut message = object
+        .get("message")
+        .or_else(|| object.get("textPayload"))
+        .map(render_log_value)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            serde_json::to_string(&serde_json::Value::Object(object.clone()))
+                .unwrap_or_else(|_| line.to_string())
+        });
+
+    let fields = object
+        .iter()
+        .filter(|(key, _)| !is_structured_log_metadata(key))
+        .map(|(key, value)| format!("{key}={}", render_log_value(value)))
+        .collect::<Vec<_>>();
+
+    if !fields.is_empty() {
+        message.push_str(" | ");
+        message.push_str(&fields.join(" "));
+    }
+
+    FormattedWorkerLog { level, message }
+}
+
+fn level_from_severity(severity: &str) -> Option<Level> {
+    match severity.to_ascii_uppercase().as_str() {
+        "DEBUG" => Some(Level::DEBUG),
+        "INFO" | "NOTICE" => Some(Level::INFO),
+        "WARNING" | "WARN" => Some(Level::WARN),
+        "ERROR" | "CRITICAL" | "ALERT" | "EMERGENCY" => Some(Level::ERROR),
+        "TRACE" => Some(Level::TRACE),
+        _ => None,
+    }
+}
+
+fn is_structured_log_metadata(key: &str) -> bool {
+    matches!(
+        key,
+        "severity"
+            | "message"
+            | "textPayload"
+            | "time"
+            | "timestamp"
+            | "logging.googleapis.com/labels"
+            | "logging.googleapis.com/sourceLocation"
+            | "logging.googleapis.com/trace"
+    )
+}
+
+fn render_log_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
     }
 }
 
@@ -745,6 +867,35 @@ exports.cleanup.__schedule = {
         assert!(should_watch_file(Path::new("index.ts")));
         assert!(should_watch_file(Path::new("src/index.tsx")));
         assert!(should_watch_file(Path::new("lib/index.js")));
+    }
+
+    #[test]
+    fn formats_firebase_structured_logs_for_terminal_output() {
+        let formatted = format_worker_log_line(
+            r#"{"severity":"INFO","message":"created user","uid":"alice","attempt":2}"#,
+            Level::WARN,
+        );
+
+        assert_eq!(
+            formatted,
+            FormattedWorkerLog {
+                level: Level::INFO,
+                message: "created user | attempt=2 uid=alice".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_plain_worker_output() {
+        let formatted = format_worker_log_line("plain stderr line", Level::WARN);
+
+        assert_eq!(
+            formatted,
+            FormattedWorkerLog {
+                level: Level::WARN,
+                message: "plain stderr line".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

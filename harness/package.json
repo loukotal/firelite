@@ -1,0 +1,13 @@
+{
+  "name": "firelite-discovery-harness",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "discover:auth": "node src/discover-auth.mjs"
+  },
+  "dependencies": {
+    "firebase": "^11.0.0",
+    "firebase-admin": "^13.0.0",
+    "firebase-tools": "^13.0.0"
+  }
+}

@@ -52,3 +52,11 @@ npm run test:auth-sdk
 ```
 
 This starts `cargo run -p firelite -- daemon` on a temporary loopback port, calls `connectAuthEmulator`, and verifies password, custom-token, and email-link sign-in flows through `firebase/auth`.
+
+Run Firelite against the real Firebase Admin Auth SDK:
+
+```sh
+npm run test:auth-admin-sdk
+```
+
+This verifies `createUser`, `getUser`, `getUserByEmail`, `listUsers`, and `deleteUser` through `firebase-admin/auth`.

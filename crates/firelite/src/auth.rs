@@ -1,6 +1,6 @@
 use crate::server::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -24,7 +24,7 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route(
             "/identitytoolkit.googleapis.com/v1/*action",
-            post(identity_action),
+            post(identity_action).get(identity_get_action),
         )
         .route(
             "/emulator/v1/projects/:project_id/accounts",
@@ -57,6 +57,10 @@ struct ProjectAuthState {
 struct UserRecord {
     local_id: String,
     email: String,
+    display_name: Option<String>,
+    photo_url: Option<String>,
+    disabled: bool,
+    email_verified: bool,
     password_hash: Option<String>,
     providers: Vec<ProviderRecord>,
     created_at_ms: u64,
@@ -138,6 +142,45 @@ struct EmailLinkRequest {
     return_secure_token: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminCreateRequest {
+    local_id: Option<String>,
+    email: Option<String>,
+    password: Option<String>,
+    display_name: Option<String>,
+    photo_url: Option<String>,
+    disabled: Option<bool>,
+    email_verified: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminLookupRequest {
+    local_id: Option<Vec<String>>,
+    email: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminDeleteRequest {
+    local_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminBatchDeleteRequest {
+    local_ids: Vec<String>,
+    force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminBatchGetQuery {
+    max_results: Option<usize>,
+    next_page_token: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthResponse {
@@ -189,6 +232,12 @@ struct ListAccountsResponse {
 struct EmulatorUser {
     local_id: String,
     email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    photo_url: Option<String>,
+    disabled: bool,
+    email_verified: bool,
     password_hash: String,
     valid_since: String,
     created_at: String,
@@ -276,10 +325,51 @@ async fn identity_action(
             let payload = parse_payload(payload)?;
             serde_json::to_value(sign_in_with_email_link(&state, payload)?)
         }
-        _ => return Err(error(StatusCode::NOT_FOUND, "NOT_FOUND")),
+        _ => {
+            if let Some((project_id, admin_action)) = parse_project_action(&action) {
+                match admin_action {
+                    "accounts" => {
+                        let payload = parse_payload(payload)?;
+                        serde_json::to_value(admin_create_user(&state, &project_id, payload)?)
+                    }
+                    "accounts:lookup" => {
+                        let payload = parse_payload(payload)?;
+                        serde_json::to_value(admin_lookup(&state, &project_id, payload)?)
+                    }
+                    "accounts:delete" => {
+                        let payload = parse_payload(payload)?;
+                        serde_json::to_value(admin_delete_user(&state, &project_id, payload)?)
+                    }
+                    "accounts:batchDelete" => {
+                        let payload = parse_payload(payload)?;
+                        serde_json::to_value(admin_batch_delete_users(
+                            &state,
+                            &project_id,
+                            payload,
+                        )?)
+                    }
+                    _ => return Err(error(StatusCode::NOT_FOUND, "NOT_FOUND")),
+                }
+            } else {
+                return Err(error(StatusCode::NOT_FOUND, "NOT_FOUND"));
+            }
+        }
     }
     .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"))?;
 
+    Ok(Json(body))
+}
+
+async fn identity_get_action(
+    State(state): State<SharedState>,
+    Path(action): Path<String>,
+    Query(query): Query<AdminBatchGetQuery>,
+) -> AuthResult<serde_json::Value> {
+    let Some((project_id, "accounts:batchGet")) = parse_project_action(&action) else {
+        return Err(error(StatusCode::NOT_FOUND, "NOT_FOUND"));
+    };
+    let body = serde_json::to_value(admin_batch_get(&state, &project_id, query)?)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"))?;
     Ok(Json(body))
 }
 
@@ -302,6 +392,10 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
     let record = UserRecord {
         local_id: local_id.clone(),
         email: payload.email,
+        display_name: None,
+        photo_url: None,
+        disabled: false,
+        email_verified: false,
         password_hash: Some(hash_password(&payload.password)),
         providers: vec![ProviderRecord {
             provider_id: "password".to_string(),
@@ -323,6 +417,53 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
         project_id,
         &record,
         payload.return_secure_token,
+    ))
+}
+
+fn admin_create_user(
+    state: &SharedState,
+    project_id: &str,
+    payload: AdminCreateRequest,
+) -> Result<EmulatorUser, AuthError> {
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects.entry(project_id.to_string()).or_default();
+    let local_id = payload
+        .local_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let email = payload
+        .email
+        .unwrap_or_else(|| format!("{local_id}@admin.local"));
+    let email_key = normalize_email(&email);
+
+    if project.users_by_id.contains_key(&local_id) {
+        return Err(error(StatusCode::BAD_REQUEST, "UID_EXISTS"));
+    }
+    if project.user_ids_by_email.contains_key(&email_key) {
+        return Err(error(StatusCode::BAD_REQUEST, "EMAIL_EXISTS"));
+    }
+
+    let record = UserRecord {
+        local_id: local_id.clone(),
+        email: email.clone(),
+        display_name: payload.display_name,
+        photo_url: payload.photo_url,
+        disabled: payload.disabled.unwrap_or(false),
+        email_verified: payload.email_verified.unwrap_or(false),
+        password_hash: payload.password.as_deref().map(hash_password),
+        providers: vec![ProviderRecord {
+            provider_id: "password".to_string(),
+            raw_id: local_id.clone(),
+            email: email.clone(),
+        }],
+        created_at_ms: now_ms(),
+        last_login_at_ms: None,
+    };
+    project
+        .user_ids_by_email
+        .insert(email_key, local_id.clone());
+    project.users_by_id.insert(local_id.clone(), record);
+    Ok(EmulatorUser::from(
+        project.users_by_id.get(&local_id).expect("inserted user"),
     ))
 }
 
@@ -352,6 +493,93 @@ fn sign_in_with_password(
         record,
         payload.return_secure_token,
     ))
+}
+
+fn admin_lookup(
+    state: &SharedState,
+    project_id: &str,
+    payload: AdminLookupRequest,
+) -> Result<LookupResponse, AuthError> {
+    let projects = state.auth.projects.read().expect("auth state poisoned");
+    let Some(project) = projects.get(project_id) else {
+        return Ok(LookupResponse { users: vec![] });
+    };
+
+    let mut users = Vec::new();
+    if let Some(local_ids) = payload.local_id {
+        users.extend(
+            local_ids
+                .into_iter()
+                .filter_map(|id| project.users_by_id.get(&id))
+                .map(EmulatorUser::from),
+        );
+    }
+    if let Some(emails) = payload.email {
+        users.extend(
+            emails
+                .into_iter()
+                .filter_map(|email| project.user_ids_by_email.get(&normalize_email(&email)))
+                .filter_map(|id| project.users_by_id.get(id))
+                .map(EmulatorUser::from),
+        );
+    }
+
+    Ok(LookupResponse { users })
+}
+
+fn admin_batch_get(
+    state: &SharedState,
+    project_id: &str,
+    query: AdminBatchGetQuery,
+) -> Result<ListAccountsResponse, AuthError> {
+    let _next_page_token = query.next_page_token.as_deref();
+    let max_results = query.max_results.unwrap_or(1000);
+    let projects = state.auth.projects.read().expect("auth state poisoned");
+    let users = projects
+        .get(project_id)
+        .map(|project| {
+            project
+                .users_by_id
+                .values()
+                .take(max_results)
+                .map(EmulatorUser::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(ListAccountsResponse { users })
+}
+
+fn admin_delete_user(
+    state: &SharedState,
+    project_id: &str,
+    payload: AdminDeleteRequest,
+) -> Result<EmptyResponse, AuthError> {
+    delete_account(&state.auth, project_id, &payload.local_id)?;
+    Ok(EmptyResponse {})
+}
+
+fn admin_batch_delete_users(
+    state: &SharedState,
+    project_id: &str,
+    payload: AdminBatchDeleteRequest,
+) -> Result<serde_json::Value, AuthError> {
+    if payload.force != Some(true) {
+        return Err(error(StatusCode::BAD_REQUEST, "MISSING_FORCE"));
+    }
+
+    let mut errors = Vec::new();
+    for (index, local_id) in payload.local_ids.iter().enumerate() {
+        if delete_account(&state.auth, project_id, local_id).is_err() {
+            errors.push(serde_json::json!({
+                "index": index,
+                "localId": local_id,
+                "message": "USER_NOT_FOUND"
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({ "errors": errors }))
 }
 
 fn lookup(state: &SharedState, payload: LookupRequest) -> Result<LookupResponse, AuthError> {
@@ -447,6 +675,10 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
             let record = UserRecord {
                 local_id: local_id.clone(),
                 email: email.clone(),
+                display_name: None,
+                photo_url: None,
+                disabled: false,
+                email_verified: false,
                 password_hash: None,
                 providers: vec![ProviderRecord {
                     provider_id: provider_id.clone(),
@@ -647,6 +879,10 @@ fn get_or_create_user<'a>(
     let record = UserRecord {
         local_id: local_id.to_string(),
         email: email.to_string(),
+        display_name: None,
+        photo_url: None,
+        disabled: false,
+        email_verified: false,
         password_hash: None,
         providers: vec![ProviderRecord {
             provider_id: provider_id.to_string(),
@@ -669,6 +905,15 @@ fn get_or_create_user<'a>(
         .users_by_id
         .get_mut(local_id)
         .expect("inserted user")
+}
+
+fn parse_project_action(action: &str) -> Option<(String, &str)> {
+    let rest = action.strip_prefix("projects/")?;
+    let (project_id, admin_action) = rest.split_once('/')?;
+    if project_id.is_empty() || admin_action.is_empty() {
+        return None;
+    }
+    Some((project_id.to_string(), admin_action))
 }
 
 fn parse_custom_token_subject(token: &str) -> Result<String, AuthError> {
@@ -812,6 +1057,10 @@ impl From<&UserRecord> for EmulatorUser {
         Self {
             local_id: record.local_id.clone(),
             email: record.email.clone(),
+            display_name: record.display_name.clone(),
+            photo_url: record.photo_url.clone(),
+            disabled: record.disabled,
+            email_verified: record.email_verified,
             password_hash: record.password_hash.clone().unwrap_or_default(),
             valid_since: (record.created_at_ms / 1000).to_string(),
             created_at: record.created_at_ms.to_string(),

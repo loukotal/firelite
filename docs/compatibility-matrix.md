@@ -18,6 +18,7 @@ Status legend:
 | Auth | `accounts:sendOobCode` / `accounts:signInWithEmailLink` | implemented | In-memory single-use email-link OOB codes. |
 | Auth | `/emulator/v1/projects/{project}/oobCodes` | implemented | Local inspection endpoint for email-link tests/debugging. |
 | Auth | `/emulator/v1/projects/{project}/accounts` list/reset | implemented | Used for test isolation and fixture comparison. |
+| Auth | Admin SDK `createUser`, `getUser`, `getUserByEmail`, `listUsers`, `deleteUser` | implemented | Covered by Firebase Admin SDK E2E harness. |
 | Auth | import/export | planned | Needed for parity with Emulator Suite workflows. |
 | Auth | MFA and deeper provider/OOB parity | planned | Tracked in `docs/auth-emulator-api-surface.md`; add only when real local tests require them. |
 | Cloud Tasks | REST create/list/delete/lease task flows | planned | Next bounded target after Auth fixtures. |

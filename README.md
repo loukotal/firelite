@@ -70,6 +70,20 @@ cargo run -p firelite -- \
   --watch ./functions
 ```
 
+To run Firelite from another checkout, execute Cargo from the project or
+functions directory and point `--manifest-path` at this repository:
+
+```sh
+cargo run --manifest-path /Users/louky/Documents/firelite/Cargo.toml -p firelite -- \
+  emulators \
+  --project bf-demo-a24dc \
+  --host 127.0.0.1 \
+  --auth-port 9099 \
+  --storage-port 9199 \
+  --functions-port 5001 \
+  --watch .
+```
+
 ## Development
 
 Run the Rust test suite:
@@ -100,5 +114,4 @@ Firelite is intentionally incomplete. See:
 
 ## License
 
-Apache-2.0.
-```
+MIT.

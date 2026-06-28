@@ -46,6 +46,9 @@ enum Command {
         /// Command to run in the watched functions directory before loading/reloading workers.
         #[arg(long)]
         build_command: Option<String>,
+        /// Function export/name filter. Can be repeated.
+        #[arg(long = "filter")]
+        filters: Vec<String>,
     },
     /// Run Auth, Storage, and Cloud Functions emulators together.
     Emulators {
@@ -64,6 +67,9 @@ enum Command {
         /// Command to run in the watched functions directory before loading/reloading workers.
         #[arg(long)]
         build_command: Option<String>,
+        /// Function export/name filter. Can be repeated.
+        #[arg(long = "filter")]
+        filters: Vec<String>,
     },
 }
 
@@ -93,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             watch,
             build_command,
+            filters,
         } => {
             let addr = parse_addr("functions", &host, port)?;
             firelite::functions::serve(FunctionsConfig {
@@ -100,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 source_dir: watch,
                 addr,
                 build_command,
+                filters,
             })
             .await
         }
@@ -111,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
             functions_port,
             watch,
             build_command,
+            filters,
         } => {
             let state = server::app_state();
             let daemon_addr = parse_addr("auth daemon", &host, auth_port)?;
@@ -126,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
                 source_dir: watch,
                 addr: functions_addr,
                 build_command,
+                filters,
             });
 
             if storage_port == auth_port {

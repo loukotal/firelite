@@ -30,6 +30,7 @@ pub struct FunctionsConfig {
     pub source_dir: PathBuf,
     pub addr: SocketAddr,
     pub build_command: Option<String>,
+    pub filters: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +116,7 @@ pub async fn serve(config: FunctionsConfig) -> anyhow::Result<()> {
         config.project_id.clone(),
         config.source_dir.clone(),
         config.build_command.clone(),
+        config.filters.clone(),
         state.active.clone(),
         reload_rx,
     ));
@@ -299,6 +301,7 @@ async fn supervise_workers(
     project_id: String,
     source_dir: PathBuf,
     build_command: Option<String>,
+    filters: Vec<String>,
     active: Arc<RwLock<Option<ActiveWorker>>>,
     mut reload_rx: mpsc::Receiver<()>,
 ) {
@@ -316,7 +319,7 @@ async fn supervise_workers(
             continue;
         }
 
-        match start_worker(&project_id, &source_dir, generation).await {
+        match start_worker(&project_id, &source_dir, &filters, generation).await {
             Ok(started) => {
                 let names = started
                     .active
@@ -391,6 +394,7 @@ async fn run_build_command(
 async fn start_worker(
     project_id: &str,
     source_dir: &Path,
+    filters: &[String],
     generation: u64,
 ) -> anyhow::Result<StartedWorker> {
     let worker_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/functions_worker.cjs");
@@ -426,6 +430,7 @@ async fn start_worker(
         WorkerMessage::Ready { port, functions } => (port, functions),
         WorkerMessage::Error { message } => return Err(anyhow!(message)),
     };
+    let descriptors = filter_descriptors(descriptors, filters);
     let http_functions = descriptors
         .iter()
         .cloned()
@@ -451,6 +456,36 @@ async fn start_worker(
             http_functions,
         },
     })
+}
+
+fn filter_descriptors(
+    descriptors: Vec<FunctionDescriptor>,
+    filters: &[String],
+) -> Vec<FunctionDescriptor> {
+    if filters.is_empty() {
+        return descriptors;
+    }
+
+    descriptors
+        .into_iter()
+        .filter(|descriptor| {
+            filters
+                .iter()
+                .any(|filter| descriptor_matches_filter(descriptor, filter))
+        })
+        .collect()
+}
+
+fn descriptor_matches_filter(descriptor: &FunctionDescriptor, filter: &str) -> bool {
+    function_id_matches_filter(&descriptor.entry_id, filter)
+        || function_id_matches_filter(&descriptor.name, filter)
+}
+
+fn function_id_matches_filter(value: &str, filter: &str) -> bool {
+    value == filter
+        || value
+            .strip_prefix(filter)
+            .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('/'))
 }
 
 async fn log_worker_stdout(
@@ -762,10 +797,63 @@ exports.api.__trigger = {
 "#,
         );
 
-        let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
         assert!(worker.active.http_functions.contains_key(&FunctionKey {
             region: "us-central1".to_string(),
             name: "api".to_string(),
+        }));
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filters_registered_functions_by_export_or_name() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+exports.api = (req, res) => res.end("api");
+exports.api.__trigger = {
+  name: "api",
+  regions: ["us-central1"],
+  httpsTrigger: {}
+};
+exports.admin = (req, res) => res.end("admin");
+exports.admin.__trigger = {
+  name: "admin",
+  regions: ["us-central1"],
+  httpsTrigger: {}
+};
+exports.nested = {
+  api: (req, res) => res.end("nested")
+};
+exports.nested.api.__trigger = {
+  name: "nestedApi",
+  regions: ["us-central1"],
+  httpsTrigger: {}
+};
+"#,
+        );
+
+        let filters = vec!["api".to_string()];
+        let mut worker = start_worker("demo-firelite", &dir, &filters, 1)
+            .await
+            .unwrap();
+        assert!(worker.active.http_functions.contains_key(&FunctionKey {
+            region: "us-central1".to_string(),
+            name: "api".to_string(),
+        }));
+        assert!(!worker.active.http_functions.contains_key(&FunctionKey {
+            region: "us-central1".to_string(),
+            name: "admin".to_string(),
+        }));
+        assert!(!worker.active.http_functions.contains_key(&FunctionKey {
+            region: "us-central1".to_string(),
+            name: "nestedApi".to_string(),
         }));
         worker.child.kill().await.unwrap();
     }
@@ -802,7 +890,7 @@ exports.api.__trigger = {
 "#,
         );
 
-        let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
         let state = Arc::new(FunctionsState {
             project_id: "demo-firelite".to_string(),
             active: Arc::new(RwLock::new(Some(worker.active.clone()))),
@@ -879,7 +967,7 @@ exports.cleanup.__schedule = {
 "#,
         );
 
-        let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
         let scheduled = worker
             .active
             .functions
@@ -984,7 +1072,7 @@ exports.cleanup.__schedule = {
         .await
         .unwrap();
 
-        let mut worker = start_worker("demo-firelite", &dir, 1).await.unwrap();
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
         assert!(worker.active.http_functions.contains_key(&FunctionKey {
             region: "us-central1".to_string(),
             name: "api".to_string(),

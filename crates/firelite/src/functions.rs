@@ -232,7 +232,7 @@ async fn proxy_request_inner(
 
     let mut builder = Response::builder().status(status);
     for (name, value) in response_headers.iter() {
-        if name.as_str().eq_ignore_ascii_case("content-length") {
+        if is_hop_by_hop_header(name.as_str()) {
             continue;
         }
         builder = builder.header(name, value);
@@ -246,6 +246,21 @@ async fn proxy_request_inner(
             )
                 .into_response()
         })
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "content-length"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 #[derive(Debug)]
@@ -456,43 +471,17 @@ async fn log_worker_stderr(stderr: tokio::process::ChildStderr, generation: u64)
 
 fn log_worker_line(source: &'static str, generation: u64, line: &str, fallback_level: Level) {
     let formatted = format_worker_log_line(line, fallback_level);
+    let message = format!(
+        "[functions worker:{source} generation={generation}] {}",
+        formatted.message
+    );
 
     match formatted.level {
-        Level::ERROR => event!(
-            Level::ERROR,
-            generation,
-            worker = source,
-            "{}",
-            formatted.message
-        ),
-        Level::WARN => event!(
-            Level::WARN,
-            generation,
-            worker = source,
-            "{}",
-            formatted.message
-        ),
-        Level::INFO => event!(
-            Level::INFO,
-            generation,
-            worker = source,
-            "{}",
-            formatted.message
-        ),
-        Level::DEBUG => event!(
-            Level::DEBUG,
-            generation,
-            worker = source,
-            "{}",
-            formatted.message
-        ),
-        Level::TRACE => event!(
-            Level::TRACE,
-            generation,
-            worker = source,
-            "{}",
-            formatted.message
-        ),
+        Level::ERROR => event!(Level::ERROR, "{}", message),
+        Level::WARN => event!(Level::WARN, "{}", message),
+        Level::INFO => event!(Level::INFO, "{}", message),
+        Level::DEBUG => event!(Level::DEBUG, "{}", message),
+        Level::TRACE => event!(Level::TRACE, "{}", message),
     }
 }
 
@@ -503,11 +492,16 @@ struct FormattedWorkerLog {
 }
 
 fn format_worker_log_line(line: &str, fallback_level: Level) -> FormattedWorkerLog {
-    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(line)
+    let line = strip_ansi_sequences(line);
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(&line)
     else {
+        if let Some(formatted) = format_text_worker_log_line(&line, fallback_level) {
+            return formatted;
+        }
+
         return FormattedWorkerLog {
             level: fallback_level,
-            message: line.to_string(),
+            message: line,
         };
     };
 
@@ -524,7 +518,7 @@ fn format_worker_log_line(line: &str, fallback_level: Level) -> FormattedWorkerL
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
             serde_json::to_string(&serde_json::Value::Object(object.clone()))
-                .unwrap_or_else(|_| line.to_string())
+                .unwrap_or_else(|_| line.clone())
         });
 
     let fields = object
@@ -539,6 +533,62 @@ fn format_worker_log_line(line: &str, fallback_level: Level) -> FormattedWorkerL
     }
 
     FormattedWorkerLog { level, message }
+}
+
+fn format_text_worker_log_line(line: &str, fallback_level: Level) -> Option<FormattedWorkerLog> {
+    let rest = line.strip_prefix('[')?;
+    let (_, rest) = rest.split_once("] ")?;
+    let (severity, message) = rest.split_once(": ")?;
+    let level = level_from_severity(severity).unwrap_or(fallback_level);
+
+    Some(FormattedWorkerLog {
+        level,
+        message: message.to_string(),
+    })
+}
+
+fn strip_ansi_sequences(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        let is_real_escape = ch == '\u{1b}';
+        let is_escaped_escape = ch == '\\' && chars.peek() == Some(&'x');
+
+        if is_real_escape || is_escaped_escape {
+            if is_escaped_escape {
+                let mut clone = chars.clone();
+                if clone.next() != Some('x')
+                    || clone.next() != Some('1')
+                    || clone.next() != Some('b')
+                    || clone.next() != Some('[')
+                {
+                    output.push(ch);
+                    continue;
+                }
+                chars.next();
+                chars.next();
+                chars.next();
+            }
+
+            if is_real_escape && chars.peek() != Some(&'[') {
+                continue;
+            }
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for code in chars.by_ref() {
+                    if code.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
 }
 
 fn level_from_severity(severity: &str) -> Option<Level> {
@@ -894,6 +944,22 @@ exports.cleanup.__schedule = {
             FormattedWorkerLog {
                 level: Level::WARN,
                 message: "plain stderr line".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn strips_ansi_sequences_from_worker_output() {
+        let formatted = format_worker_log_line(
+            r#"[11:26:20] \x1b[34mDEBUG\x1b[39m: \x1b[36mUpdating user\x1b[39m"#,
+            Level::INFO,
+        );
+
+        assert_eq!(
+            formatted,
+            FormattedWorkerLog {
+                level: Level::DEBUG,
+                message: "Updating user".to_string(),
             }
         );
     }

@@ -1,6 +1,6 @@
 use crate::server::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -23,8 +23,14 @@ type SharedState = Arc<AppState>;
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route(
+            "/securetoken.googleapis.com/v1/token",
+            post(refresh_secure_token).options(preflight),
+        )
+        .route(
             "/identitytoolkit.googleapis.com/v1/*action",
-            post(identity_action).get(identity_get_action),
+            post(identity_action)
+                .get(identity_get_action)
+                .options(preflight),
         )
         .route(
             "/emulator/v1/projects/:project_id/accounts",
@@ -59,6 +65,7 @@ struct UserRecord {
     email: String,
     display_name: Option<String>,
     photo_url: Option<String>,
+    custom_attributes: Option<String>,
     disabled: bool,
     email_verified: bool,
     password_hash: Option<String>,
@@ -95,6 +102,12 @@ struct SignInRequest {
     email: String,
     password: String,
     return_secure_token: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshTokenRequest {
+    grant_type: String,
+    refresh_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +163,18 @@ struct AdminCreateRequest {
     password: Option<String>,
     display_name: Option<String>,
     photo_url: Option<String>,
+    custom_attributes: Option<String>,
+    disabled: Option<bool>,
+    email_verified: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUpdateRequest {
+    local_id: String,
+    display_name: Option<String>,
+    photo_url: Option<String>,
+    custom_attributes: Option<String>,
     disabled: Option<bool>,
     email_verified: Option<bool>,
 }
@@ -190,6 +215,17 @@ struct AuthResponse {
     id_token: String,
     refresh_token: String,
     expires_in: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SecureTokenResponse {
+    access_token: String,
+    expires_in: String,
+    token_type: &'static str,
+    refresh_token: String,
+    id_token: String,
+    user_id: String,
+    project_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +272,8 @@ struct EmulatorUser {
     display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     photo_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custom_attributes: Option<String>,
     disabled: bool,
     email_verified: bool,
     password_hash: String,
@@ -287,6 +325,35 @@ impl IntoResponse for AuthError {
 
 type AuthResult<T> = Result<Json<T>, AuthError>;
 
+async fn preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn refresh_secure_token(
+    State(state): State<SharedState>,
+    Form(payload): Form<RefreshTokenRequest>,
+) -> AuthResult<SecureTokenResponse> {
+    if payload.grant_type != "refresh_token" {
+        return Err(error(StatusCode::BAD_REQUEST, "UNSUPPORTED_GRANT_TYPE"));
+    }
+    let (project_id, local_id) = parse_refresh_token(&payload.refresh_token)?;
+    let projects = state.auth.projects.read().expect("auth state poisoned");
+    let record = projects
+        .get(&project_id)
+        .and_then(|project| project.users_by_id.get(&local_id))
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    let id_token = make_token(&project_id, record);
+    Ok(Json(SecureTokenResponse {
+        access_token: id_token.clone(),
+        expires_in: "3600".to_string(),
+        token_type: "Bearer",
+        refresh_token: make_refresh_token(&project_id, &local_id),
+        id_token,
+        user_id: local_id,
+        project_id,
+    }))
+}
+
 async fn identity_action(
     State(state): State<SharedState>,
     Path(action): Path<String>,
@@ -336,6 +403,10 @@ async fn identity_action(
                         let payload = parse_payload(payload)?;
                         serde_json::to_value(admin_lookup(&state, &project_id, payload)?)
                     }
+                    "accounts:update" => {
+                        let payload = parse_payload(payload)?;
+                        serde_json::to_value(admin_update_user(&state, &project_id, payload)?)
+                    }
                     "accounts:delete" => {
                         let payload = parse_payload(payload)?;
                         serde_json::to_value(admin_delete_user(&state, &project_id, payload)?)
@@ -374,9 +445,9 @@ async fn identity_get_action(
 }
 
 fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, AuthError> {
-    let project_id = DEFAULT_PROJECT;
+    let project_id = default_project_id();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.to_string()).or_default();
+    let project = projects.entry(project_id.clone()).or_default();
     let email_key = normalize_email(&payload.email);
 
     if project.user_ids_by_email.contains_key(&email_key) {
@@ -394,6 +465,7 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
         email: payload.email,
         display_name: None,
         photo_url: None,
+        custom_attributes: None,
         disabled: false,
         email_verified: false,
         password_hash: Some(hash_password(&payload.password)),
@@ -414,7 +486,7 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
         .insert(record.local_id.clone(), record.clone());
 
     Ok(auth_response(
-        project_id,
+        &project_id,
         &record,
         payload.return_secure_token,
     ))
@@ -447,6 +519,7 @@ fn admin_create_user(
         email: email.clone(),
         display_name: payload.display_name,
         photo_url: payload.photo_url,
+        custom_attributes: payload.custom_attributes,
         disabled: payload.disabled.unwrap_or(false),
         email_verified: payload.email_verified.unwrap_or(false),
         password_hash: payload.password.as_deref().map(hash_password),
@@ -467,13 +540,45 @@ fn admin_create_user(
     ))
 }
 
+fn admin_update_user(
+    state: &SharedState,
+    project_id: &str,
+    payload: AdminUpdateRequest,
+) -> Result<EmulatorUser, AuthError> {
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let Some(project) = projects.get_mut(project_id) else {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
+    };
+    let Some(record) = project.users_by_id.get_mut(&payload.local_id) else {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
+    };
+
+    if let Some(display_name) = payload.display_name {
+        record.display_name = Some(display_name);
+    }
+    if let Some(photo_url) = payload.photo_url {
+        record.photo_url = Some(photo_url);
+    }
+    if let Some(custom_attributes) = payload.custom_attributes {
+        record.custom_attributes = Some(custom_attributes);
+    }
+    if let Some(disabled) = payload.disabled {
+        record.disabled = disabled;
+    }
+    if let Some(email_verified) = payload.email_verified {
+        record.email_verified = email_verified;
+    }
+
+    Ok(EmulatorUser::from(&*record))
+}
+
 fn sign_in_with_password(
     state: &SharedState,
     payload: SignInRequest,
 ) -> Result<AuthResponse, AuthError> {
-    let project_id = DEFAULT_PROJECT;
+    let project_id = project_id_for_email(&state.auth, &payload.email);
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.to_string()).or_default();
+    let project = projects.entry(project_id.clone()).or_default();
     let email_key = normalize_email(&payload.email);
     let Some(local_id) = project.user_ids_by_email.get(&email_key).cloned() else {
         return Err(error(StatusCode::BAD_REQUEST, "EMAIL_NOT_FOUND"));
@@ -489,7 +594,7 @@ fn sign_in_with_password(
 
     record.last_login_at_ms = Some(now_ms());
     Ok(auth_response(
-        project_id,
+        &project_id,
         record,
         payload.return_secure_token,
     ))
@@ -583,25 +688,29 @@ fn admin_batch_delete_users(
 }
 
 fn lookup(state: &SharedState, payload: LookupRequest) -> Result<LookupResponse, AuthError> {
-    let project_id = DEFAULT_PROJECT;
     let projects = state.auth.projects.read().expect("auth state poisoned");
-    let Some(project) = projects.get(project_id) else {
-        return Ok(LookupResponse { users: vec![] });
-    };
 
-    let mut ids = Vec::new();
+    let mut users = Vec::new();
     if let Some(id_token) = payload.id_token {
-        ids.push(parse_token_local_id(&id_token)?);
+        let claims = parse_token_claims(&id_token)?;
+        if let Some(record) = projects
+            .get(&claims.project_id)
+            .and_then(|project| project.users_by_id.get(&claims.local_id))
+        {
+            users.push(EmulatorUser::from(record));
+        }
     }
     if let Some(local_ids) = payload.local_id {
-        ids.extend(local_ids);
+        let project_id = default_project_id();
+        if let Some(project) = projects.get(&project_id) {
+            users.extend(
+                local_ids
+                    .into_iter()
+                    .filter_map(|id| project.users_by_id.get(&id))
+                    .map(EmulatorUser::from),
+            );
+        }
     }
-
-    let users = ids
-        .into_iter()
-        .filter_map(|id| project.users_by_id.get(&id))
-        .map(EmulatorUser::from)
-        .collect();
 
     Ok(LookupResponse { users })
 }
@@ -610,14 +719,16 @@ fn delete_identity_account(
     state: &SharedState,
     payload: DeleteRequest,
 ) -> Result<EmptyResponse, AuthError> {
-    let project_id = DEFAULT_PROJECT;
-    let local_id = match (payload.local_id, payload.id_token) {
-        (Some(local_id), _) => local_id,
-        (None, Some(id_token)) => parse_token_local_id(&id_token)?,
+    let (project_id, local_id) = match (payload.local_id, payload.id_token) {
+        (Some(local_id), _) => (default_project_id(), local_id),
+        (None, Some(id_token)) => {
+            let claims = parse_token_claims(&id_token)?;
+            (claims.project_id, claims.local_id)
+        }
         (None, None) => return Err(error(StatusCode::BAD_REQUEST, "MISSING_LOCAL_ID")),
     };
 
-    delete_account(&state.auth, project_id, &local_id)?;
+    delete_account(&state.auth, &project_id, &local_id)?;
     Ok(EmptyResponse {})
 }
 
@@ -625,23 +736,23 @@ fn sign_in_with_custom_token(
     state: &SharedState,
     payload: CustomTokenRequest,
 ) -> Result<AuthResponse, AuthError> {
-    let project_id = DEFAULT_PROJECT;
+    let project_id = default_project_id();
     let local_id = parse_custom_token_subject(&payload.token)?;
     let email = format!("{local_id}@custom-token.local");
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.to_string()).or_default();
+    let project = projects.entry(project_id.clone()).or_default();
     let record = get_or_create_user(project, &local_id, &email, "custom", &local_id);
 
     record.last_login_at_ms = Some(now_ms());
     Ok(auth_response(
-        project_id,
+        &project_id,
         record,
         payload.return_secure_token,
     ))
 }
 
 fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResponse, AuthError> {
-    let project_id = DEFAULT_PROJECT;
+    let project_id = default_project_id();
     let _request_uri = payload.request_uri.as_deref().unwrap_or("http://localhost");
     let post_body = parse_post_body(&payload.post_body);
     let provider_id = post_body
@@ -663,7 +774,7 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
         .unwrap_or_else(|| format!("{}@{}.local", sanitize_email_part(&raw_id), provider_id));
 
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.to_string()).or_default();
+    let project = projects.entry(project_id.clone()).or_default();
     let local_id = project
         .user_ids_by_provider
         .get(&(provider_id.clone(), raw_id.clone()))
@@ -677,6 +788,7 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
                 email: email.clone(),
                 display_name: None,
                 photo_url: None,
+                custom_attributes: None,
                 disabled: false,
                 email_verified: false,
                 password_hash: None,
@@ -705,7 +817,7 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
 
     record.last_login_at_ms = Some(now_ms());
     Ok(auth_response(
-        project_id,
+        &project_id,
         record,
         payload.return_secure_token,
     ))
@@ -723,10 +835,10 @@ fn send_oob_code(
     }
 
     let _continue_url = payload.continue_url.as_deref().unwrap_or("");
-    let project_id = DEFAULT_PROJECT;
+    let project_id = default_project_id();
     let code = format!("firelite-oob-{}", Uuid::new_v4());
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.to_string()).or_default();
+    let project = projects.entry(project_id.clone()).or_default();
     project.oob_codes.insert(
         code.clone(),
         OobCodeRecord {
@@ -746,9 +858,9 @@ fn sign_in_with_email_link(
     state: &SharedState,
     payload: EmailLinkRequest,
 ) -> Result<AuthResponse, AuthError> {
-    let project_id = DEFAULT_PROJECT;
+    let project_id = default_project_id();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.to_string()).or_default();
+    let project = projects.entry(project_id.clone()).or_default();
     let Some(code) = project.oob_codes.remove(&payload.oob_code) else {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_OOB_CODE"));
     };
@@ -773,7 +885,7 @@ fn sign_in_with_email_link(
     record.last_login_at_ms = Some(now_ms());
 
     Ok(auth_response(
-        project_id,
+        &project_id,
         record,
         payload.return_secure_token,
     ))
@@ -881,6 +993,7 @@ fn get_or_create_user<'a>(
         email: email.to_string(),
         display_name: None,
         photo_url: None,
+        custom_attributes: None,
         disabled: false,
         email_verified: false,
         password_hash: None,
@@ -992,26 +1105,84 @@ fn auth_response(
         local_id: record.local_id.clone(),
         email: record.email.clone(),
         id_token: include_token
-            .then(|| make_token(project_id, &record.local_id))
+            .then(|| make_token(project_id, record))
             .unwrap_or_default(),
         refresh_token: include_token
-            .then(|| format!("firelite-refresh-{}", Uuid::new_v4()))
+            .then(|| make_refresh_token(project_id, &record.local_id))
             .unwrap_or_default(),
         expires_in: "3600".to_string(),
     }
 }
 
-fn make_token(project_id: &str, local_id: &str) -> String {
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+fn make_refresh_token(project_id: &str, local_id: &str) -> String {
     let payload = URL_SAFE_NO_PAD.encode(format!(
-        r#"{{"aud":"{project_id}","iss":"https://securetoken.google.com/{project_id}","sub":"{local_id}","user_id":"{local_id}","iat":{},"exp":{}}}"#,
-        now_secs(),
-        now_secs() + 3600
+        r#"{{"project_id":"{project_id}","local_id":"{local_id}","nonce":"{}"}}"#,
+        Uuid::new_v4()
     ));
+    format!("firelite-refresh.{payload}")
+}
+
+fn parse_refresh_token(token: &str) -> Result<(String, String), AuthError> {
+    let Some(payload) = token.strip_prefix("firelite-refresh.") else {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"));
+    };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"))?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"))?;
+    let project_id = value
+        .get("project_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"))?;
+    let local_id = value
+        .get("local_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"))?;
+    Ok((project_id.to_string(), local_id.to_string()))
+}
+
+fn make_token(project_id: &str, record: &UserRecord) -> String {
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+    let issued_at = now_secs();
+    let mut payload = serde_json::json!({
+        "aud": project_id,
+        "iss": format!("https://securetoken.google.com/{project_id}"),
+        "sub": record.local_id,
+        "user_id": record.local_id,
+        "email": record.email,
+        "email_verified": record.email_verified,
+        "iat": issued_at,
+        "auth_time": issued_at,
+        "exp": issued_at + 3600,
+        "firebase": {
+            "sign_in_provider": "password",
+            "identities": {
+                "email": [record.email]
+            }
+        },
+    });
+    if let Some(custom_attributes) = &record.custom_attributes {
+        if let Ok(serde_json::Value::Object(claims)) =
+            serde_json::from_str::<serde_json::Value>(custom_attributes)
+        {
+            let object = payload.as_object_mut().expect("token payload is an object");
+            for (key, value) in claims {
+                object.insert(key, value);
+            }
+        }
+    }
+    let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
     format!("{header}.{payload}.")
 }
 
-fn parse_token_local_id(token: &str) -> Result<String, AuthError> {
+#[derive(Debug)]
+struct TokenClaims {
+    project_id: String,
+    local_id: String,
+}
+
+fn parse_token_claims(token: &str) -> Result<TokenClaims, AuthError> {
     let Some(payload) = token.split('.').nth(1) else {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_ID_TOKEN"));
     };
@@ -1020,11 +1191,20 @@ fn parse_token_local_id(token: &str) -> Result<String, AuthError> {
         .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_ID_TOKEN"))?;
     let value: serde_json::Value = serde_json::from_slice(&decoded)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_ID_TOKEN"))?;
-    value
+    let local_id = value
         .get("sub")
         .and_then(|sub| sub.as_str())
         .map(ToOwned::to_owned)
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_ID_TOKEN"))
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_ID_TOKEN"))?;
+    let project_id = value
+        .get("aud")
+        .and_then(|aud| aud.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(default_project_id);
+    Ok(TokenClaims {
+        project_id,
+        local_id,
+    })
 }
 
 fn normalize_email(email: &str) -> String {
@@ -1052,6 +1232,26 @@ fn error(status: StatusCode, message: &'static str) -> AuthError {
     AuthError { status, message }
 }
 
+fn default_project_id() -> String {
+    std::env::var("GCLOUD_PROJECT")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .unwrap_or_else(|_| DEFAULT_PROJECT.to_string())
+}
+
+fn project_id_for_email(auth: &AuthState, email: &str) -> String {
+    let email_key = normalize_email(email);
+    let projects = auth.projects.read().expect("auth state poisoned");
+    projects
+        .iter()
+        .find_map(|(project_id, project)| {
+            project
+                .user_ids_by_email
+                .contains_key(&email_key)
+                .then(|| project_id.clone())
+        })
+        .unwrap_or_else(default_project_id)
+}
+
 impl From<&UserRecord> for EmulatorUser {
     fn from(record: &UserRecord) -> Self {
         Self {
@@ -1059,6 +1259,7 @@ impl From<&UserRecord> for EmulatorUser {
             email: record.email.clone(),
             display_name: record.display_name.clone(),
             photo_url: record.photo_url.clone(),
+            custom_attributes: record.custom_attributes.clone(),
             disabled: record.disabled,
             email_verified: record.email_verified,
             password_hash: record.password_hash.clone().unwrap_or_default(),

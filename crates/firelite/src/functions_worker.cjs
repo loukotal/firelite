@@ -55,7 +55,10 @@ async function main() {
       return;
     }
 
-    req.url = `${match[2] || "/"}${parsed.search}`;
+    const suffix = match[2] || "/";
+    req.url = `${suffix}${parsed.search}`;
+    req.originalUrl = req.url;
+    req.route ||= { path: suffix };
     try {
       const result = handler(req, res);
       if (result && typeof result.then === "function") {

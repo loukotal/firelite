@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use firelite::server;
-use reqwest::StatusCode;
+use reqwest::{header, StatusCode};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -88,6 +88,213 @@ async fn auth_create_sign_in_list_delete_flow() {
         .await
         .unwrap();
     assert_eq!(listed_after_delete["users"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn auth_secure_token_refresh_supports_browser_sdk_cors_flow() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake"
+        ))
+        .json(&json!({
+            "email": "refresh@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let preflight = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{base_url}/securetoken.googleapis.com/v1/token?key=fake"),
+        )
+        .header(header::ORIGIN, "http://localhost:3010")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "content-type,x-client-version,x-firebase-client,x-firebase-gmpid",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(preflight.status().is_success());
+    assert_eq!(
+        preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "*"
+    );
+
+    let refreshed: Value = client
+        .post(format!(
+            "{base_url}/securetoken.googleapis.com/v1/token?key=fake"
+        ))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                created["refreshToken"].as_str().expect("refresh token"),
+            ),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(refreshed["user_id"], created["localId"]);
+    assert_eq!(refreshed["project_id"], "demo-firelite");
+    assert_eq!(refreshed["expires_in"], "3600");
+    assert!(refreshed["id_token"].as_str().unwrap().contains('.'));
+    assert!(refreshed["access_token"].as_str().unwrap().contains('.'));
+    assert!(refreshed["refresh_token"]
+        .as_str()
+        .unwrap()
+        .starts_with("firelite-refresh."));
+}
+
+#[tokio::test]
+async fn auth_admin_update_custom_claims_are_in_new_id_tokens() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "claims@example.test",
+            "password": "secret123",
+            "emailVerified": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "localId": created["localId"].as_str().unwrap(),
+            "customAttributes": "{\"admin\":true,\"superadmin\":true,\"partner\":\"admin\"}"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let signed_in: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "claims@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token_payload = decode_jwt_payload(signed_in["idToken"].as_str().unwrap());
+    assert_eq!(token_payload["email"], "claims@example.test");
+    assert_eq!(token_payload["email_verified"], true);
+    assert!(token_payload["auth_time"].as_u64().is_some());
+    assert_eq!(token_payload["firebase"]["sign_in_provider"], "password");
+    assert_eq!(
+        token_payload["firebase"]["identities"]["email"][0],
+        "claims@example.test"
+    );
+    assert_eq!(token_payload["admin"], true);
+    assert_eq!(token_payload["superadmin"], true);
+    assert_eq!(token_payload["partner"], "admin");
+}
+
+#[tokio::test]
+async fn auth_password_sign_in_finds_admin_created_user_project() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/bf-demo-a24dc/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "admin-created@example.test",
+            "password": "password",
+            "emailVerified": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let signed_in: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "admin-created@example.test",
+            "password": "password",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(signed_in["email"], "admin-created@example.test");
+    let token_payload = decode_jwt_payload(signed_in["idToken"].as_str().unwrap());
+    assert_eq!(token_payload["aud"], "bf-demo-a24dc");
+
+    let lookup: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=fake"
+        ))
+        .json(&json!({
+            "idToken": signed_in["idToken"].as_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(lookup["users"][0]["email"], "admin-created@example.test");
 }
 
 #[tokio::test]
@@ -269,4 +476,10 @@ fn unsigned_jwt(payload: Value) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
     format!("{header}.{payload}.")
+}
+
+fn decode_jwt_payload(token: &str) -> Value {
+    let payload = token.split('.').nth(1).unwrap();
+    let decoded = URL_SAFE_NO_PAD.decode(payload).unwrap();
+    serde_json::from_slice(&decoded).unwrap()
 }

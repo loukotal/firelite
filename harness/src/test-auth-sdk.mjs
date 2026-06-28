@@ -71,6 +71,13 @@ async function testPasswordFlow(auth) {
   const signedIn = await signInWithEmailAndPassword(auth, email, password);
   assert.equal(signedIn.user.uid, created.user.uid);
   assert.equal(signedIn.user.email, email);
+
+  const tokenResult = await signedIn.user.getIdTokenResult();
+  assert.equal(tokenResult.signInProvider, "password");
+  assert.equal(tokenResult.claims.email, email);
+  assert.equal(tokenResult.claims.email_verified, false);
+  assert.equal(tokenResult.claims.firebase.sign_in_provider, "password");
+  assert.ok(tokenResult.claims.auth_time);
 }
 
 async function testCustomTokenFlow(auth) {

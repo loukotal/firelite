@@ -1,17 +1,25 @@
 # Firelite
 
-Firelite is an experimental, unofficial Firebase Emulator Suite-compatible local emulator system focused on fast startup, fast reload, and low idle overhead for multi-checkout agent development.
+Firelite is an experimental local emulator system for a small, tested subset of Firebase Emulator Suite-compatible workflows. It is focused on fast startup, fast reload, and low idle overhead for multi-checkout development.
 
-It is not a Firebase product and does not try to clone production Firebase. The immediate goal is to discover the local SDK/emulator contracts, capture them as fixtures, and implement only the compatibility surface needed for local tests and checkout-specific Cloud Functions workflows.
+> [!WARNING]
+> Firelite is alpha software. It is not an official Firebase, Google, or Firebase Emulator Suite project, and it is not affiliated with or endorsed by Firebase or Google. It implements only selected local emulator behaviors and must not be used as a production Firebase replacement.
 
-## Current milestone
+The immediate goal is to discover local SDK/emulator contracts, capture them as fixtures, and implement only the compatibility surface needed for local tests and checkout-specific Cloud Functions workflows.
+
+## Features
 
 - Rust workspace and `firelite` CLI.
-- Minimal Auth emulator state namespaced by Firebase project ID.
+- Auth emulator state namespaced by Firebase project ID.
+- Storage emulator state for common JSON API and `/v0` object paths.
 - Checkout-local Cloud Functions supervisor with Node handler discovery and reload.
-- Contract fixtures for basic Auth create, sign-in, list, and delete flows.
-- Compatibility harness scaffolding for running official Firebase emulators and SDK probes.
+- Contract tests and SDK harnesses for supported Auth and Storage flows.
 - Architecture and compatibility notes in `docs/`.
+
+## Requirements
+
+- Rust 1.82 or newer.
+- Node.js and npm for the optional SDK compatibility harness.
 
 ## Quick start
 
@@ -54,10 +62,43 @@ Example:
 ```sh
 cargo run -p firelite -- \
   emulators \
-  --project bf-demo-a24dc \
+  --project demo-myrepo-agent-17 \
   --host 127.0.0.1 \
   --auth-port 9099 \
   --storage-port 9199 \
   --functions-port 5001 \
-  --watch /Users/louky/Work/zenbase/bf-fn/functions
+  --watch ./functions
+```
+
+## Development
+
+Run the Rust test suite:
+
+```sh
+cargo test
+```
+
+Run the optional Firebase SDK compatibility harness:
+
+```sh
+cd harness
+npm install
+npm run test:auth
+npm run test:auth-admin-sdk
+npm run test:storage-sdk
+```
+
+The harness starts Firelite on temporary loopback ports and verifies supported flows with the official Firebase Web and Admin SDK packages.
+
+## Project Status
+
+Firelite is intentionally incomplete. See:
+
+- `docs/compatibility-matrix.md` for supported, planned, and unknown surfaces.
+- `docs/auth-emulator-api-surface.md` for Auth compatibility notes.
+- `docs/architecture.md` for the process model and compatibility strategy.
+
+## License
+
+Apache-2.0.
 ```

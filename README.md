@@ -81,15 +81,21 @@ To attach separately started functions workers to a daemon:
 # terminal 1
 firelite daemon --host 127.0.0.1 --port 9099
 
-# terminal 2
-firelite functions --project demo-myrepo-agent-17 --watch ./functions --port 5001 --filter api
-
-# terminal 3
-firelite attach \
+# terminal 2: starts a functions worker and registers it with the daemon
+firelite functions \
   --project demo-myrepo-agent-17 \
-  --workdir . \
-  --functions-port 5001 \
-  --filter api
+  --watch ./functions \
+  --port 5001 \
+  --filter api \
+  --attach
+
+# terminal 3: optional second worker on another port
+firelite functions \
+  --project demo-myrepo-agent-17 \
+  --watch ./functions \
+  --port 5002 \
+  --filter e2e \
+  --attach
 
 firelite attachments
 
@@ -109,7 +115,8 @@ cargo run --manifest-path /Users/louky/Documents/firelite/Cargo.toml -p firelite
   --storage-port 9199 \
   --functions-port 5001 \
   --watch . \
-  --filter api
+  --filter api \
+  --filter e2e
 ```
 
 ## Development

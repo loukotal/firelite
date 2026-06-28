@@ -72,6 +72,13 @@ enum Command {
         /// Function export/name filter. Can be repeated.
         #[arg(long = "filter")]
         filters: Vec<String>,
+        /// Register this functions worker with a running daemon.
+        #[arg(long)]
+        attach: bool,
+        #[arg(long, default_value = "127.0.0.1")]
+        daemon_host: String,
+        #[arg(long, default_value_t = 9099)]
+        daemon_port: u16,
     },
     /// Run Auth, Storage, and Cloud Functions emulators together.
     Emulators {
@@ -140,8 +147,23 @@ async fn main() -> anyhow::Result<()> {
             watch,
             build_command,
             filters,
+            attach,
+            daemon_host,
+            daemon_port,
         } => {
             let addr = parse_addr("functions", &host, port)?;
+            if attach {
+                attach_worker(
+                    project.clone(),
+                    watch.clone(),
+                    daemon_host,
+                    daemon_port,
+                    host.clone(),
+                    port,
+                    filters.clone(),
+                )
+                .await?;
+            }
             firelite::functions::serve(FunctionsConfig {
                 project_id: project,
                 source_dir: watch,
@@ -164,6 +186,19 @@ async fn main() -> anyhow::Result<()> {
             let state = server::app_state();
             let daemon_addr = parse_addr("auth daemon", &host, auth_port)?;
             let functions_addr = parse_addr("functions", &host, functions_port)?;
+            let workdir = std::fs::canonicalize(&watch).unwrap_or_else(|_| watch.clone());
+
+            firelite::control::register_attachment(
+                &state,
+                AttachRequest {
+                    project_id: project.clone(),
+                    workdir: workdir.display().to_string(),
+                    functions_host: host.clone(),
+                    functions_port,
+                    filters: filters.clone(),
+                },
+            )
+            .map_err(|status| anyhow::anyhow!("failed to register functions worker: {status}"))?;
 
             let daemon = server::serve_with_state(
                 "firelite auth emulator",

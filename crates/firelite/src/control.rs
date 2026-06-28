@@ -62,6 +62,13 @@ async fn attach_worker(
     State(state): State<SharedState>,
     Json(payload): Json<AttachRequest>,
 ) -> Result<Json<FunctionAttachment>, StatusCode> {
+    Ok(Json(register_attachment(&state, payload)?))
+}
+
+pub fn register_attachment(
+    state: &SharedState,
+    payload: AttachRequest,
+) -> Result<FunctionAttachment, StatusCode> {
     if payload.project_id.trim().is_empty()
         || payload.workdir.trim().is_empty()
         || payload.functions_host.trim().is_empty()
@@ -90,7 +97,7 @@ async fn attach_worker(
         .expect("attachments state poisoned")
         .insert(attachment.id.clone(), attachment.clone());
 
-    Ok(Json(attachment))
+    Ok(attachment)
 }
 
 async fn list_attachments(State(state): State<SharedState>) -> Json<AttachmentsResponse> {

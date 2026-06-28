@@ -47,6 +47,24 @@ enum Command {
         #[arg(long)]
         build_command: Option<String>,
     },
+    /// Run Auth, Storage, and Cloud Functions emulators together.
+    Emulators {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 9099)]
+        auth_port: u16,
+        #[arg(long, default_value_t = 9199)]
+        storage_port: u16,
+        #[arg(long, default_value_t = 5001)]
+        functions_port: u16,
+        #[arg(long)]
+        watch: PathBuf,
+        /// Command to run in the watched functions directory before loading/reloading workers.
+        #[arg(long)]
+        build_command: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -55,9 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Daemon { host, port } => {
-            let addr: SocketAddr = format!("{host}:{port}")
-                .parse()
-                .with_context(|| format!("invalid daemon address {host}:{port}"))?;
+            let addr = parse_addr("daemon", &host, port)?;
             server::serve(DaemonConfig { addr }).await
         }
         Command::Attach { project, workdir } => {
@@ -78,9 +94,7 @@ async fn main() -> anyhow::Result<()> {
             watch,
             build_command,
         } => {
-            let addr: SocketAddr = format!("{host}:{port}")
-                .parse()
-                .with_context(|| format!("invalid functions address {host}:{port}"))?;
+            let addr = parse_addr("functions", &host, port)?;
             firelite::functions::serve(FunctionsConfig {
                 project_id: project,
                 source_dir: watch,
@@ -89,7 +103,50 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+        Command::Emulators {
+            project,
+            host,
+            auth_port,
+            storage_port,
+            functions_port,
+            watch,
+            build_command,
+        } => {
+            let state = server::app_state();
+            let daemon_addr = parse_addr("auth daemon", &host, auth_port)?;
+            let functions_addr = parse_addr("functions", &host, functions_port)?;
+
+            let daemon = server::serve_with_state(
+                "firelite auth emulator",
+                DaemonConfig { addr: daemon_addr },
+                state.clone(),
+            );
+            let functions = firelite::functions::serve(FunctionsConfig {
+                project_id: project,
+                source_dir: watch,
+                addr: functions_addr,
+                build_command,
+            });
+
+            if storage_port == auth_port {
+                tokio::try_join!(daemon, functions)?;
+            } else {
+                let storage_addr = parse_addr("storage", &host, storage_port)?;
+                let storage = server::serve_storage_with_state(
+                    DaemonConfig { addr: storage_addr },
+                    state.clone(),
+                );
+                tokio::try_join!(daemon, storage, functions)?;
+            }
+            Ok(())
+        }
     }
+}
+
+fn parse_addr(label: &str, host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    format!("{host}:{port}")
+        .parse()
+        .with_context(|| format!("invalid {label} address {host}:{port}"))
 }
 
 fn init_tracing() {

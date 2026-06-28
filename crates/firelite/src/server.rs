@@ -23,12 +23,18 @@ pub struct AppState {
     pub storage: storage::StorageState,
 }
 
-pub fn app() -> Router {
-    let state = Arc::new(AppState {
+pub fn app_state() -> Arc<AppState> {
+    Arc::new(AppState {
         auth: auth::AuthState::default(),
         storage: storage::StorageState::default(),
-    });
+    })
+}
 
+pub fn app() -> Router {
+    app_with_state(app_state())
+}
+
+pub fn app_with_state(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/__/health", get(health))
@@ -40,16 +46,54 @@ pub fn app() -> Router {
         .with_state(state)
 }
 
+pub fn storage_app_with_state(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/__/health", get(health))
+        .merge(storage::router())
+        .fallback(fallback)
+        .layer(middleware::from_fn(add_cors_headers))
+        .with_state(state)
+}
+
 pub async fn serve(config: DaemonConfig) -> anyhow::Result<()> {
+    serve_router("firelite daemon", config, app()).await
+}
+
+pub async fn serve_with_state(
+    name: &'static str,
+    config: DaemonConfig,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    serve_router(name, config, app_with_state(state)).await
+}
+
+pub async fn serve_storage_with_state(
+    config: DaemonConfig,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    serve_router(
+        "firelite storage emulator",
+        config,
+        storage_app_with_state(state),
+    )
+    .await
+}
+
+async fn serve_router(
+    name: &'static str,
+    config: DaemonConfig,
+    router: Router,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.addr)
         .await
         .with_context(|| format!("failed to bind {}", config.addr))?;
 
-    info!(addr = %config.addr, "firelite daemon listening");
-    axum::serve(listener, app())
+    info!(addr = %config.addr, "{name} listening");
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("firelite daemon stopped unexpectedly")
+        .with_context(|| format!("{name} stopped unexpectedly"))
 }
 
 async fn root() -> &'static str {

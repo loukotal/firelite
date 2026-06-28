@@ -250,7 +250,7 @@ async fn proxy_request_inner(
         })
 }
 
-fn is_hop_by_hop_header(name: &str) -> bool {
+pub(crate) fn is_hop_by_hop_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "connection"
@@ -266,14 +266,14 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 #[derive(Debug)]
-struct ParsedRoute {
-    project_id: String,
-    region: String,
-    name: String,
-    suffix: String,
+pub(crate) struct ParsedRoute {
+    pub(crate) project_id: String,
+    pub(crate) region: String,
+    pub(crate) name: String,
+    pub(crate) suffix: String,
 }
 
-fn parse_function_route(path: &str) -> Option<ParsedRoute> {
+pub(crate) fn parse_function_route(path: &str) -> Option<ParsedRoute> {
     let mut parts = path.trim_start_matches('/').split('/');
     let project_id = parts.next()?.to_string();
     let region = parts.next()?.to_string();
@@ -481,7 +481,7 @@ fn descriptor_matches_filter(descriptor: &FunctionDescriptor, filter: &str) -> b
         || function_id_matches_filter(&descriptor.name, filter)
 }
 
-fn function_id_matches_filter(value: &str, filter: &str) -> bool {
+pub(crate) fn function_id_matches_filter(value: &str, filter: &str) -> bool {
     value == filter
         || value
             .strip_prefix(filter)

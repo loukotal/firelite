@@ -92,6 +92,9 @@ firelite attach \
   --filter api
 
 firelite attachments
+
+# The daemon can now proxy attached function routes:
+curl http://127.0.0.1:9099/demo-myrepo-agent-17/us-central1/api
 ```
 
 To run Firelite from another checkout, execute Cargo from the project or

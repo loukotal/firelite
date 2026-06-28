@@ -111,11 +111,98 @@ async fn attaches_multiple_functions_workers() {
         .any(|attachment| attachment["id"] == "demo-firelite@127.0.0.1:5002"));
 }
 
+#[tokio::test]
+async fn proxies_function_routes_to_attached_worker() {
+    let base_url = spawn_app().await;
+    let worker_url = spawn_mock_functions_worker().await;
+    let worker_port = worker_url
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{base_url}/__/control/attachments"))
+        .json(&serde_json::json!({
+            "projectId": "demo-firelite",
+            "workdir": "/tmp/checkout",
+            "functionsHost": "127.0.0.1",
+            "functionsPort": worker_port,
+            "filters": ["api"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let proxied: Value = client
+        .post(format!(
+            "{base_url}/demo-firelite/us-central1/api/users/1?debug=true"
+        ))
+        .header("x-firelite-test", "attached-worker")
+        .body("hello")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        proxied["path"],
+        "/demo-firelite/us-central1/api/users/1?debug=true"
+    );
+    assert_eq!(proxied["method"], "POST");
+    assert_eq!(proxied["header"], "attached-worker");
+    assert_eq!(proxied["body"], "hello");
+}
+
 async fn spawn_app() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, server::app()).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_mock_functions_worker() -> String {
+    use axum::{
+        body::Bytes,
+        extract::OriginalUri,
+        http::{HeaderMap, Method},
+        response::Json,
+        routing::any,
+        Router,
+    };
+
+    async fn handler(
+        OriginalUri(uri): OriginalUri,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<Value> {
+        Json(serde_json::json!({
+            "method": method.as_str(),
+            "path": uri.to_string(),
+            "header": headers
+                .get("x-firelite-test")
+                .and_then(|value| value.to_str().ok()),
+            "body": String::from_utf8_lossy(&body),
+        }))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/*path", any(handler)))
+            .await
+            .unwrap();
     });
     format!("http://{addr}")
 }

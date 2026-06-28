@@ -22,6 +22,7 @@ pub struct AppState {
     pub auth: auth::AuthState,
     pub storage: storage::StorageState,
     pub attachments: Arc<std::sync::RwLock<BTreeMap<String, control::FunctionAttachment>>>,
+    pub http_client: reqwest::Client,
 }
 
 pub fn app_state() -> Arc<AppState> {
@@ -29,6 +30,7 @@ pub fn app_state() -> Arc<AppState> {
         auth: auth::AuthState::default(),
         storage: storage::StorageState::default(),
         attachments: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+        http_client: reqwest::Client::new(),
     })
 }
 

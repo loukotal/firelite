@@ -47,6 +47,7 @@ curl -s 'http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signUp
 ```sh
 firelite daemon
 firelite attach --project demo-myrepo-agent-17 --workdir ./checkout-17
+firelite attachments
 firelite reset --project demo-myrepo-agent-17
 firelite functions --project demo-myrepo-agent-17 --watch ./functions --port 5001
 firelite functions --project demo-myrepo-agent-17 --watch ./functions --build-command 'npm run build'
@@ -54,7 +55,7 @@ firelite emulators --project demo-myrepo-agent-17 --watch ./functions
 firelite emulators --project demo-myrepo-agent-17 --watch ./functions --filter api
 ```
 
-`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. For TypeScript functions, pass the same SWC/tsc build command the Firebase emulator expects; Firelite runs it before the initial load and before each reload. `attach` and `reset` are still present to lock the UX surface and will be wired to the daemon control plane in later milestones.
+`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. For TypeScript functions, pass the same SWC/tsc build command the Firebase emulator expects; Firelite runs it before the initial load and before each reload. `attach` registers a running checkout-local functions worker with the daemon control plane; `attachments` lists registered workers. `reset` is still present to lock the UX surface and will be wired to the daemon control plane in later milestones.
 
 `emulators` runs Auth, Storage, and Functions together. By default it listens on Firebase-compatible local ports: Auth on `127.0.0.1:9099`, Storage on `127.0.0.1:9199`, and Functions on `127.0.0.1:5001`. The Auth and Storage listeners share the same in-memory state.
 
@@ -73,6 +74,25 @@ cargo run -p firelite -- \
 ```
 
 Pass `--filter` to run only selected Cloud Functions exports/names. It can be repeated, for example `--filter api --filter e2e`.
+
+To attach separately started functions workers to a daemon:
+
+```sh
+# terminal 1
+firelite daemon --host 127.0.0.1 --port 9099
+
+# terminal 2
+firelite functions --project demo-myrepo-agent-17 --watch ./functions --port 5001 --filter api
+
+# terminal 3
+firelite attach \
+  --project demo-myrepo-agent-17 \
+  --workdir . \
+  --functions-port 5001 \
+  --filter api
+
+firelite attachments
+```
 
 To run Firelite from another checkout, execute Cargo from the project or
 functions directory and point `--manifest-path` at this repository:

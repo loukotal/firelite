@@ -68,6 +68,49 @@ async fn storage_management_create_list_delete_flow() {
     assert_eq!(listed_after_delete["items"].as_array().unwrap().len(), 0);
 }
 
+#[tokio::test]
+async fn attaches_multiple_functions_workers() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    for (port, filters) in [(5001, vec!["api"]), (5002, vec!["e2e"])] {
+        client
+            .post(format!("{base_url}/__/control/attachments"))
+            .json(&serde_json::json!({
+                "projectId": "demo-firelite",
+                "workdir": format!("/tmp/checkout-{port}"),
+                "functionsHost": "127.0.0.1",
+                "functionsPort": port,
+                "filters": filters
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+
+    let listed: Value = client
+        .get(format!("{base_url}/__/control/attachments"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let attachments = listed["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 2);
+    assert!(attachments
+        .iter()
+        .any(|attachment| attachment["id"] == "demo-firelite@127.0.0.1:5001"));
+    assert!(attachments
+        .iter()
+        .any(|attachment| attachment["id"] == "demo-firelite@127.0.0.1:5002"));
+}
+
 async fn spawn_app() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

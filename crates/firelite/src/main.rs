@@ -80,7 +80,7 @@ enum Command {
         #[arg(long, default_value_t = 9099)]
         daemon_port: u16,
     },
-    /// Run Auth, Storage, and Cloud Functions emulators together.
+    /// Run Auth, Storage, Cloud Tasks, and Cloud Functions emulators together.
     Emulators {
         #[arg(long)]
         project: String,
@@ -90,6 +90,8 @@ enum Command {
         auth_port: u16,
         #[arg(long, default_value_t = 9199)]
         storage_port: u16,
+        #[arg(long, default_value_t = 9499)]
+        tasks_port: u16,
         #[arg(long, default_value_t = 5001)]
         functions_port: u16,
         #[arg(long)]
@@ -178,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
             host,
             auth_port,
             storage_port,
+            tasks_port,
             functions_port,
             watch,
             build_command,
@@ -185,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let state = server::app_state();
             let daemon_addr = parse_addr("auth daemon", &host, auth_port)?;
+            let tasks_addr = parse_addr("cloud tasks", &host, tasks_port)?;
             let functions_addr = parse_addr("functions", &host, functions_port)?;
             let workdir = std::fs::canonicalize(&watch).unwrap_or_else(|_| watch.clone());
 
@@ -212,16 +216,18 @@ async fn main() -> anyhow::Result<()> {
                 build_command,
                 filters,
             });
+            let tasks =
+                server::serve_tasks_with_state(DaemonConfig { addr: tasks_addr }, state.clone());
 
             if storage_port == auth_port {
-                tokio::try_join!(daemon, functions)?;
+                tokio::try_join!(daemon, tasks, functions)?;
             } else {
                 let storage_addr = parse_addr("storage", &host, storage_port)?;
                 let storage = server::serve_storage_with_state(
                     DaemonConfig { addr: storage_addr },
                     state.clone(),
                 );
-                tokio::try_join!(daemon, storage, functions)?;
+                tokio::try_join!(daemon, storage, tasks, functions)?;
             }
             Ok(())
         }

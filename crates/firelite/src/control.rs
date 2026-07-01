@@ -135,13 +135,14 @@ async fn proxy_attached_function_inner(
     body: Bytes,
 ) -> Result<Response, Response> {
     let route = parse_function_route(path).ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
-    let attachment = find_attachment(&state, &route.project_id, &route.name).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            "no attached functions worker for route",
-        )
-            .into_response()
-    })?;
+    let attachment = find_attachment_for_function(&state, &route.project_id, &route.name)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "no attached functions worker for route",
+            )
+                .into_response()
+        })?;
 
     let mut target = format!(
         "http://{}:{}{}",
@@ -202,7 +203,7 @@ async fn proxy_attached_function_inner(
         })
 }
 
-fn find_attachment(
+pub(crate) fn find_attachment_for_function(
     state: &SharedState,
     project_id: &str,
     function_name: &str,

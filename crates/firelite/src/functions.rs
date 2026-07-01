@@ -1000,6 +1000,36 @@ exports.cleanup.__schedule = {
         worker.child.kill().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn discovers_task_queue_functions_as_http_routes() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+exports.jobs = {
+  run: (req, res) => res.end("task")
+};
+exports.jobs.run.__trigger = {
+  name: "jobs.run",
+  regions: ["us-central1"],
+  taskQueueTrigger: {}
+};
+"#,
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
+        assert!(worker.active.http_functions.contains_key(&FunctionKey {
+            region: "us-central1".to_string(),
+            name: "jobs.run".to_string(),
+        }));
+        worker.child.kill().await.unwrap();
+    }
+
     #[test]
     fn watches_typescript_inputs() {
         assert!(should_watch_file(Path::new("index.ts")));

@@ -57,7 +57,7 @@ firelite emulators --project demo-myrepo-agent-17 --watch ./functions --filter a
 
 `daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. For TypeScript functions, pass the same SWC/tsc build command the Firebase emulator expects; Firelite runs it before the initial load and before each reload. `attach` registers a running checkout-local functions worker with the daemon control plane; `attachments` lists registered workers. `reset` is still present to lock the UX surface and will be wired to the daemon control plane in later milestones.
 
-`emulators` runs Auth, Storage, and Functions together. By default it listens on Firebase-compatible local ports: Auth on `127.0.0.1:9099`, Storage on `127.0.0.1:9199`, and Functions on `127.0.0.1:5001`. The Auth and Storage listeners share the same in-memory state.
+`emulators` runs Auth, Storage, Cloud Tasks, and Functions together. By default it listens on Firebase-compatible local ports: Auth on `127.0.0.1:9099`, Storage on `127.0.0.1:9199`, Cloud Tasks on `127.0.0.1:9499`, and Functions on `127.0.0.1:5001`. The listeners share the same in-memory state.
 
 Example:
 
@@ -68,12 +68,15 @@ cargo run -p firelite -- \
   --host 127.0.0.1 \
   --auth-port 9099 \
   --storage-port 9199 \
+  --tasks-port 9499 \
   --functions-port 5001 \
   --watch ./functions \
   --filter api
 ```
 
 Pass `--filter` to run only selected Cloud Functions exports/names. It can be repeated, for example `--filter api --filter e2e`.
+
+Cloud Tasks accepts Firebase Admin SDK task queue `createTask` calls at `CLOUD_TASKS_EMULATOR_HOST=127.0.0.1:9499`. Enqueued task queue requests are dispatched to the attached functions worker whose filter matches the queue/function name. In the basic implementation, dispatch is synchronous and runs before the create-task response returns.
 
 To attach separately started functions workers to a daemon:
 
@@ -113,6 +116,7 @@ cargo run --manifest-path /Users/louky/Documents/firelite/Cargo.toml -p firelite
   --host 127.0.0.1 \
   --auth-port 9099 \
   --storage-port 9199 \
+  --tasks-port 9499 \
   --functions-port 5001 \
   --watch . \
   --filter api \

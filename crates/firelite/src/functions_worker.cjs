@@ -213,6 +213,18 @@ function describeGen1(entryId, trigger, value) {
     };
   }
 
+  if (trigger.taskQueueTrigger) {
+    return {
+      entryId,
+      name,
+      region: regions[0],
+      trigger: {
+        type: "https",
+        callable: false,
+      },
+    };
+  }
+
   if (trigger.eventTrigger) {
     const resource = trigger.eventTrigger.resource || null;
     if (
@@ -276,6 +288,18 @@ function describeGen2(entryId, endpoint) {
       trigger: {
         type: "https",
         callable: Boolean(endpoint.callableTrigger),
+      },
+    };
+  }
+
+  if (endpoint.taskQueueTrigger) {
+    return {
+      entryId,
+      name,
+      region,
+      trigger: {
+        type: "https",
+        callable: false,
       },
     };
   }

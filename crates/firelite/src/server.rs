@@ -1,4 +1,4 @@
-use crate::{auth, config::DaemonConfig, control, storage, tasks, web_ui};
+use crate::{auth, config::DaemonConfig, control, pubsub, storage, tasks, web_ui};
 use anyhow::Context;
 use axum::{
     extract::Request,
@@ -21,6 +21,7 @@ use tracing::info;
 pub struct AppState {
     pub auth: auth::AuthState,
     pub storage: storage::StorageState,
+    pub pubsub: pubsub::PubsubState,
     pub tasks: tasks::TasksState,
     pub attachments: Arc<std::sync::RwLock<BTreeMap<String, control::FunctionAttachment>>>,
     pub http_client: reqwest::Client,
@@ -30,6 +31,7 @@ pub fn app_state() -> Arc<AppState> {
     Arc::new(AppState {
         auth: auth::AuthState::default(),
         storage: storage::StorageState::default(),
+        pubsub: pubsub::PubsubState::default(),
         tasks: tasks::TasksState::default(),
         attachments: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         http_client: reqwest::Client::new(),
@@ -48,6 +50,7 @@ pub fn app_with_state(state: Arc<AppState>) -> Router {
         .merge(control::router())
         .merge(auth::router())
         .merge(storage::router())
+        .merge(pubsub::router())
         .merge(tasks::router())
         .fallback(fallback)
         .layer(middleware::from_fn(add_cors_headers))
@@ -69,6 +72,16 @@ pub fn tasks_app_with_state(state: Arc<AppState>) -> Router {
         .route("/", get(root))
         .route("/__/health", get(health))
         .merge(tasks::router())
+        .fallback(fallback)
+        .layer(middleware::from_fn(add_cors_headers))
+        .with_state(state)
+}
+
+pub fn pubsub_app_with_state(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/__/health", get(health))
+        .merge(pubsub::router())
         .fallback(fallback)
         .layer(middleware::from_fn(add_cors_headers))
         .with_state(state)
@@ -106,6 +119,18 @@ pub async fn serve_tasks_with_state(
         "firelite cloud tasks emulator",
         config,
         tasks_app_with_state(state),
+    )
+    .await
+}
+
+pub async fn serve_pubsub_with_state(
+    config: DaemonConfig,
+    state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    serve_router(
+        "firelite pubsub emulator",
+        config,
+        pubsub_app_with_state(state),
     )
     .await
 }

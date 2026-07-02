@@ -1,9 +1,19 @@
 [package]
 name = "firelite"
 version = "0.1.0"
+description = "A lightweight Firebase Emulator Suite-compatible local emulator for focused development workflows."
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+repository = "https://github.com/loukotal/firelite"
+homepage = "https://github.com/loukotal/firelite"
+documentation = "https://github.com/loukotal/firelite"
+keywords = ["firebase", "emulator", "auth", "storage", "functions"]
+categories = ["command-line-utilities", "development-tools::testing"]
+exclude = [
+    "tests/fixtures/**",
+]
 
 [[bin]]
 name = "firelite"

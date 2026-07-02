@@ -433,9 +433,8 @@ async fn start_worker(
     let descriptors = filter_descriptors(descriptors, filters);
     let http_functions = descriptors
         .iter()
-        .cloned()
-        .into_iter()
         .filter(|descriptor| matches!(descriptor.trigger, TriggerKind::Https { .. }))
+        .cloned()
         .map(|descriptor| {
             (
                 FunctionKey {

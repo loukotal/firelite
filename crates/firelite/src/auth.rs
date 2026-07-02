@@ -1104,12 +1104,16 @@ fn auth_response(
         kind: "identitytoolkit#SignupNewUserResponse",
         local_id: record.local_id.clone(),
         email: record.email.clone(),
-        id_token: include_token
-            .then(|| make_token(project_id, record))
-            .unwrap_or_default(),
-        refresh_token: include_token
-            .then(|| make_refresh_token(project_id, &record.local_id))
-            .unwrap_or_default(),
+        id_token: if include_token {
+            make_token(project_id, record)
+        } else {
+            String::default()
+        },
+        refresh_token: if include_token {
+            make_refresh_token(project_id, &record.local_id)
+        } else {
+            String::default()
+        },
         expires_in: "3600".to_string(),
     }
 }

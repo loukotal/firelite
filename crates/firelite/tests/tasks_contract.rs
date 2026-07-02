@@ -1,10 +1,5 @@
 use axum::{
-    body::Bytes,
-    extract::State,
-    http::HeaderMap,
-    response::IntoResponse,
-    routing::post,
-    Router,
+    body::Bytes, extract::State, http::HeaderMap, response::IntoResponse, routing::post, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use firelite::server;
@@ -49,7 +44,10 @@ async fn cloud_tasks_create_dispatch_list_delete_flow() {
     assert!(task_name.starts_with(&format!("{queue_path}/tasks/")));
 
     let captured = received.recv().await.expect("task dispatch request");
-    assert_eq!(captured.body, Bytes::from_static(br#"{"email":"alice@example.test"}"#));
+    assert_eq!(
+        captured.body,
+        Bytes::from_static(br#"{"email":"alice@example.test"}"#)
+    );
     assert_eq!(captured.queue_name, queue_path);
     assert_eq!(captured.task_name, task_name);
 

@@ -16,7 +16,7 @@ Firelite separates checkout-specific process work from shared stateful emulator 
 - `firelite attach`: planned registration of `{ project_id, workdir, ports, env }`.
 - `firelite reset`: planned per-project state reset across all enabled services.
 - `firelite functions`: checkout-local function worker supervisor. It starts a Node worker, discovers Firebase Functions exports from the watched source directory, proxies emulator-compatible HTTP function URLs, and restarts the worker when source files change.
-- `auth`: first implemented service, currently in-memory only.
+- `auth`, `storage`, `pubsub`, and `tasks`: in-memory, project-scoped emulator state.
 
 ## Compatibility strategy
 

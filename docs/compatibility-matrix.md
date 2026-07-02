@@ -23,7 +23,7 @@ Status legend:
 | Auth | MFA and deeper provider/OOB parity | planned | Tracked in `docs/auth-emulator-api-surface.md`; add only when real local tests require them. |
 | Cloud Tasks | REST create/list/delete task flows | implemented | Supports Firebase Admin SDK emulator REST create calls, in-memory list/get/delete, and base64 HTTP body decoding. Lease/pause/purge behavior remains planned. |
 | Cloud Tasks | Functions task queue dispatch | implemented | Dispatches task queue requests to the attached functions worker matching the queue/function name. Basic version is synchronous and single-attempt. |
-| Pub/Sub | topic/subscription CRUD and publish/pull | planned | Implement SDK-compatible subset before full behavior. |
+| Pub/Sub | topic/subscription CRUD and publish/pull/acknowledge | implemented | HTTP/JSON emulator subset, in-memory and project-scoped. Full SDK gRPC behavior still needs discovery. |
 | Pub/Sub | push delivery to Functions emulator | unknown | Needs event flow capture. |
 | Storage | JSON API media upload/download/list/delete | implemented | In-memory object state with `/upload/storage/v1`, `/storage/v1`, and Firebase `/v0` object paths. Defer XML API, resumable uploads, and full Firebase Security Rules fidelity. |
 | Storage | Emulator bucket object inspection/reset | implemented | `/emulator/v1/projects/{project}/storage/buckets/{bucket}/objects` supports list/reset for local tests. |

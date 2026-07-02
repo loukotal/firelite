@@ -27,7 +27,15 @@ pub fn router() -> Router<SharedState> {
             post(create_task).get(list_tasks),
         )
         .route(
+            "/v2/projects/:project_id/locations/:location_id/queues/:queue_id/tasks",
+            post(create_task).get(list_tasks),
+        )
+        .route(
             "/projects/:project_id/locations/:location_id/queues/:queue_id/tasks/:task_id",
+            get(get_task).delete(delete_task),
+        )
+        .route(
+            "/v2/projects/:project_id/locations/:location_id/queues/:queue_id/tasks/:task_id",
             get(get_task).delete(delete_task),
         )
 }

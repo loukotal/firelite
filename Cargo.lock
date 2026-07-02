@@ -346,6 +346,7 @@ dependencies = [
  "base64",
  "clap",
  "http",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,11 +1,14 @@
 use crate::server::AppState;
 use axum::{
+    body::{Body, Bytes},
     extract::{Path, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use http_body_util::{BodyExt, Full};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -17,10 +20,8 @@ type SharedState = Arc<AppState>;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        .route(
-            "/v1/projects/:project_id/topics",
-            get(list_topics),
-        )
+        .route("/google.pubsub.v1.Publisher/Publish", post(grpc_publish))
+        .route("/v1/projects/:project_id/topics", get(list_topics))
         .route(
             "/v1/projects/:project_id/topics/:topic",
             get(get_topic)
@@ -238,11 +239,7 @@ async fn get_topic(
     Path((project_id, topic)): Path<(String, String)>,
 ) -> PubsubResult<TopicResponse> {
     let topic_name = topic_name(&project_id, &topic);
-    let projects = state
-        .pubsub
-        .projects
-        .read()
-        .expect("pubsub state poisoned");
+    let projects = state.pubsub.projects.read().expect("pubsub state poisoned");
     let topic = projects
         .get(&project_id)
         .and_then(|project| project.topics.get(&topic_name))
@@ -255,11 +252,7 @@ async fn list_topics(
     State(state): State<SharedState>,
     Path(project_id): Path<String>,
 ) -> PubsubResult<ListTopicsResponse> {
-    let projects = state
-        .pubsub
-        .projects
-        .read()
-        .expect("pubsub state poisoned");
+    let projects = state.pubsub.projects.read().expect("pubsub state poisoned");
     let topics = projects
         .get(&project_id)
         .map(|project| {
@@ -306,20 +299,61 @@ async fn publish_topic(
         .strip_suffix(":publish")
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "UNSUPPORTED_TOPIC_ACTION"))?;
     let topic_name = topic_name(&project_id, topic);
+    Ok(Json(publish_messages(
+        state,
+        project_id,
+        topic_name,
+        payload.messages,
+        false,
+    )?))
+}
+
+async fn grpc_publish(State(state): State<SharedState>, body: Bytes) -> Response {
+    match decode_grpc_publish_request(&body)
+        .and_then(|request| {
+            let (project_id, topic_name) = parse_topic_name(&request.topic)
+                .ok_or_else(|| GrpcError::new(3, "invalid topic name"))?;
+            publish_messages(state, project_id, topic_name, request.messages, true)
+                .map_err(GrpcError::from)
+        })
+        .map(|response| encode_publish_response(&response.message_ids))
+    {
+        Ok(payload) => grpc_response(payload),
+        Err(err) => grpc_error_response(err),
+    }
+}
+
+fn publish_messages(
+    state: SharedState,
+    project_id: String,
+    topic_name: String,
+    messages: Vec<PublishMessage>,
+    create_topic_if_missing: bool,
+) -> Result<PublishResponse, PubsubError> {
     let mut projects = state
         .pubsub
         .projects
         .write()
         .expect("pubsub state poisoned");
-    let project = projects
-        .get_mut(&project_id)
-        .ok_or_else(|| error(StatusCode::NOT_FOUND, "TOPIC_NOT_FOUND"))?;
+    let project = if create_topic_if_missing {
+        projects.entry(project_id).or_default()
+    } else {
+        projects
+            .get_mut(&project_id)
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, "TOPIC_NOT_FOUND"))?
+    };
     if !project.topics.contains_key(&topic_name) {
-        return Err(error(StatusCode::NOT_FOUND, "TOPIC_NOT_FOUND"));
+        if create_topic_if_missing {
+            project
+                .topics
+                .insert(topic_name.clone(), TopicRecord::default());
+        } else {
+            return Err(error(StatusCode::NOT_FOUND, "TOPIC_NOT_FOUND"));
+        }
     }
 
-    let mut message_ids = Vec::with_capacity(payload.messages.len());
-    for input in payload.messages {
+    let mut message_ids = Vec::with_capacity(messages.len());
+    for input in messages {
         project.next_message_id += 1;
         let message_id = project.next_message_id.to_string();
         let message = PubsubMessage {
@@ -338,7 +372,7 @@ async fn publish_topic(
         message_ids.push(message_id);
     }
 
-    Ok(Json(PublishResponse { message_ids }))
+    Ok(PublishResponse { message_ids })
 }
 
 async fn create_subscription(
@@ -378,11 +412,7 @@ async fn get_subscription(
     Path((project_id, subscription)): Path<(String, String)>,
 ) -> PubsubResult<SubscriptionResponse> {
     let subscription_name = subscription_name(&project_id, &subscription);
-    let projects = state
-        .pubsub
-        .projects
-        .read()
-        .expect("pubsub state poisoned");
+    let projects = state.pubsub.projects.read().expect("pubsub state poisoned");
     let subscription = projects
         .get(&project_id)
         .and_then(|project| project.subscriptions.get(&subscription_name))
@@ -398,11 +428,7 @@ async fn list_subscriptions(
     State(state): State<SharedState>,
     Path(project_id): Path<String>,
 ) -> PubsubResult<ListSubscriptionsResponse> {
-    let projects = state
-        .pubsub
-        .projects
-        .read()
-        .expect("pubsub state poisoned");
+    let projects = state.pubsub.projects.read().expect("pubsub state poisoned");
     let subscriptions = projects
         .get(&project_id)
         .map(|project| {
@@ -445,17 +471,21 @@ async fn subscription_action(
     if let Some(subscription) = subscription_action.strip_suffix(":pull") {
         let request = serde_json::from_value(payload)
             .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_PULL_REQUEST"))?;
-        return Ok(pull_subscription(state, project_id, subscription.to_string(), request)
-            .await?
-            .into_response());
+        return Ok(
+            pull_subscription(state, project_id, subscription.to_string(), request)
+                .await?
+                .into_response(),
+        );
     }
 
     if let Some(subscription) = subscription_action.strip_suffix(":acknowledge") {
         let request = serde_json::from_value(payload)
             .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_ACKNOWLEDGE_REQUEST"))?;
-        return Ok(acknowledge_subscription(state, project_id, subscription.to_string(), request)
-            .await?
-            .into_response());
+        return Ok(
+            acknowledge_subscription(state, project_id, subscription.to_string(), request)
+                .await?
+                .into_response(),
+        );
     }
 
     Err(error(
@@ -537,11 +567,7 @@ async fn project_snapshot(
     State(state): State<SharedState>,
     Path(project_id): Path<String>,
 ) -> PubsubResult<ProjectSnapshot> {
-    let projects = state
-        .pubsub
-        .projects
-        .read()
-        .expect("pubsub state poisoned");
+    let projects = state.pubsub.projects.read().expect("pubsub state poisoned");
     let Some(project) = projects.get(&project_id) else {
         return Ok(Json(ProjectSnapshot {
             topics: Vec::new(),
@@ -604,6 +630,22 @@ fn topic_name(project_id: &str, topic: &str) -> String {
     format!("projects/{project_id}/topics/{topic}")
 }
 
+fn parse_topic_name(topic: &str) -> Option<(String, String)> {
+    let mut parts = topic.split('/');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("projects"), Some(project_id), Some("topics"), Some(topic_id), None) => {
+            Some((project_id.to_string(), topic_name(project_id, topic_id)))
+        }
+        _ => None,
+    }
+}
+
 fn subscription_name(project_id: &str, subscription: &str) -> String {
     format!("projects/{project_id}/subscriptions/{subscription}")
 }
@@ -617,4 +659,249 @@ fn now_ms() -> u64 {
 
 fn error(status: StatusCode, message: &'static str) -> PubsubError {
     PubsubError { status, message }
+}
+
+#[derive(Debug)]
+struct GrpcPublishRequest {
+    topic: String,
+    messages: Vec<PublishMessage>,
+}
+
+#[derive(Debug)]
+struct GrpcError {
+    code: u8,
+    message: String,
+}
+
+impl GrpcError {
+    fn new(code: u8, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<PubsubError> for GrpcError {
+    fn from(value: PubsubError) -> Self {
+        let code = match value.status {
+            StatusCode::NOT_FOUND => 5,
+            StatusCode::BAD_REQUEST => 3,
+            _ => 13,
+        };
+        Self::new(code, value.message)
+    }
+}
+
+fn decode_grpc_publish_request(body: &[u8]) -> Result<GrpcPublishRequest, GrpcError> {
+    if body.len() < 5 {
+        return Err(GrpcError::new(3, "missing grpc frame"));
+    }
+    if body[0] != 0 {
+        return Err(GrpcError::new(
+            12,
+            "compressed grpc frames are not supported",
+        ));
+    }
+    let len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    let end = 5usize
+        .checked_add(len)
+        .ok_or_else(|| GrpcError::new(3, "invalid grpc frame length"))?;
+    if body.len() < end {
+        return Err(GrpcError::new(3, "truncated grpc frame"));
+    }
+
+    decode_publish_request_message(&body[5..end])
+}
+
+fn decode_publish_request_message(bytes: &[u8]) -> Result<GrpcPublishRequest, GrpcError> {
+    let mut cursor = 0;
+    let mut topic = None;
+    let mut messages = Vec::new();
+
+    while cursor < bytes.len() {
+        let tag = read_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field, wire_type) {
+            (1, 2) => topic = Some(read_string(bytes, &mut cursor)?),
+            (2, 2) => {
+                let message_bytes = read_len_delimited(bytes, &mut cursor)?;
+                messages.push(decode_pubsub_message(message_bytes)?);
+            }
+            _ => skip_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(GrpcPublishRequest {
+        topic: topic.ok_or_else(|| GrpcError::new(3, "missing topic"))?,
+        messages,
+    })
+}
+
+fn decode_pubsub_message(bytes: &[u8]) -> Result<PublishMessage, GrpcError> {
+    let mut cursor = 0;
+    let mut data = String::new();
+    let mut attributes = BTreeMap::new();
+    let mut ordering_key = None;
+
+    while cursor < bytes.len() {
+        let tag = read_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field, wire_type) {
+            (1, 2) => data = BASE64.encode(read_len_delimited(bytes, &mut cursor)?),
+            (2, 2) => {
+                let entry = read_len_delimited(bytes, &mut cursor)?;
+                if let Some((key, value)) = decode_string_map_entry(entry)? {
+                    attributes.insert(key, value);
+                }
+            }
+            (5, 2) => ordering_key = Some(read_string(bytes, &mut cursor)?),
+            _ => skip_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(PublishMessage {
+        data,
+        attributes,
+        ordering_key,
+    })
+}
+
+fn decode_string_map_entry(bytes: &[u8]) -> Result<Option<(String, String)>, GrpcError> {
+    let mut cursor = 0;
+    let mut key = None;
+    let mut value = None;
+
+    while cursor < bytes.len() {
+        let tag = read_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field, wire_type) {
+            (1, 2) => key = Some(read_string(bytes, &mut cursor)?),
+            (2, 2) => value = Some(read_string(bytes, &mut cursor)?),
+            _ => skip_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(key.zip(value))
+}
+
+fn read_varint(bytes: &[u8], cursor: &mut usize) -> Result<u64, GrpcError> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    while shift < 64 {
+        let byte = *bytes
+            .get(*cursor)
+            .ok_or_else(|| GrpcError::new(3, "truncated varint"))?;
+        *cursor += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+    Err(GrpcError::new(3, "invalid varint"))
+}
+
+fn read_len_delimited<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], GrpcError> {
+    let len = read_varint(bytes, cursor)? as usize;
+    let end = (*cursor)
+        .checked_add(len)
+        .ok_or_else(|| GrpcError::new(3, "invalid length-delimited field"))?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| GrpcError::new(3, "truncated length-delimited field"))?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_string(bytes: &[u8], cursor: &mut usize) -> Result<String, GrpcError> {
+    String::from_utf8(read_len_delimited(bytes, cursor)?.to_vec())
+        .map_err(|_| GrpcError::new(3, "invalid utf-8 string"))
+}
+
+fn skip_field(bytes: &[u8], cursor: &mut usize, wire_type: u64) -> Result<(), GrpcError> {
+    match wire_type {
+        0 => {
+            read_varint(bytes, cursor)?;
+        }
+        1 => {
+            *cursor = (*cursor)
+                .checked_add(8)
+                .ok_or_else(|| GrpcError::new(3, "invalid fixed64 field"))?;
+        }
+        2 => {
+            read_len_delimited(bytes, cursor)?;
+        }
+        5 => {
+            *cursor = (*cursor)
+                .checked_add(4)
+                .ok_or_else(|| GrpcError::new(3, "invalid fixed32 field"))?;
+        }
+        _ => return Err(GrpcError::new(3, "unsupported protobuf wire type")),
+    }
+
+    if *cursor > bytes.len() {
+        return Err(GrpcError::new(3, "truncated protobuf field"));
+    }
+    Ok(())
+}
+
+fn encode_publish_response(message_ids: &[String]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for message_id in message_ids {
+        write_len_delimited_field(&mut payload, 1, message_id.as_bytes());
+    }
+    payload
+}
+
+fn write_len_delimited_field(out: &mut Vec<u8>, field: u64, value: &[u8]) {
+    write_varint(out, (field << 3) | 2);
+    write_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn grpc_response(payload: Vec<u8>) -> Response {
+    let mut frame = Vec::with_capacity(payload.len() + 5);
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+
+    let body = Full::new(Bytes::from(frame)).with_trailers(async {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        Some(Ok(trailers))
+    });
+
+    let mut response = Body::new(body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+    response
+}
+
+fn grpc_error_response(error: GrpcError) -> Response {
+    let mut response = Body::empty().into_response();
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+    headers.insert(
+        "grpc-status",
+        HeaderValue::from_str(&error.code.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("13")),
+    );
+    headers.insert(
+        "grpc-message",
+        HeaderValue::from_str(&error.message)
+            .unwrap_or_else(|_| HeaderValue::from_static("internal")),
+    );
+    response
 }

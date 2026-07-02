@@ -283,11 +283,20 @@ async fn dispatch_task(
         .send()
         .await
         .map_err(|_| error(StatusCode::BAD_GATEWAY, "TASK_DISPATCH_FAILED"))?;
-    if !response.status().is_success() {
-        return Err(error(
-            StatusCode::BAD_GATEWAY,
-            format!("TASK_DISPATCH_HTTP_{}", response.status().as_u16()),
-        ));
+    let status = response.status();
+    if !status.is_success() {
+        let response_body = response.text().await.unwrap_or_default();
+        let detail = response_body.trim();
+        let message = if detail.is_empty() {
+            format!("TASK_DISPATCH_HTTP_{}", status.as_u16())
+        } else {
+            format!(
+                "TASK_DISPATCH_HTTP_{}: {}",
+                status.as_u16(),
+                truncate_error_detail(detail)
+            )
+        };
+        return Err(error(StatusCode::BAD_GATEWAY, message));
     }
 
     info!(task = %task_name, target = %target, "dispatched cloud task");
@@ -326,6 +335,19 @@ fn error(status: StatusCode, message: impl Into<String>) -> TasksError {
         status,
         message: message.into(),
     }
+}
+
+fn truncate_error_detail(detail: &str) -> String {
+    const MAX_LEN: usize = 800;
+    if detail.len() <= MAX_LEN {
+        return detail.to_string();
+    }
+
+    let mut end = MAX_LEN;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &detail[..end])
 }
 
 fn now_ms() -> u64 {

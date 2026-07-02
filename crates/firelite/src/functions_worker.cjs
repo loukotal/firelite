@@ -33,7 +33,7 @@ async function main() {
     if (descriptor.trigger.type === "https") {
       const handler = getExport(loaded, descriptor.entryId);
       if (typeof handler === "function") {
-        handlers.set(descriptor.entryId, handler);
+        handlers.set(descriptor.entryId, { handler, descriptor });
       }
     }
   }
@@ -48,33 +48,25 @@ async function main() {
     }
 
     const entryId = decodeURIComponent(match[1]);
-    const handler = handlers.get(entryId);
-    if (!handler) {
+    const registration = handlers.get(entryId);
+    if (!registration) {
       res.statusCode = 404;
       res.end("function not found");
       return;
     }
+    const { handler, descriptor } = registration;
 
     const suffix = match[2] || "/";
     req.url = `${suffix}${parsed.search}`;
     req.originalUrl = req.url;
     req.route ||= { path: suffix };
-    try {
-      const result = handler(req, res);
-      if (result && typeof result.then === "function") {
-        result.catch((error) => {
-          if (!res.headersSent) {
-            res.statusCode = 500;
-          }
-          res.end(error && error.stack ? error.stack : String(error));
-        });
-      }
-    } catch (error) {
+
+    invokeHandler(req, res, handler, descriptor).catch((error) => {
       if (!res.headersSent) {
         res.statusCode = 500;
       }
       res.end(error && error.stack ? error.stack : String(error));
-    }
+    });
   });
 
   server.on("error", (error) => fail(error && error.stack ? error.stack : String(error)));
@@ -84,6 +76,82 @@ async function main() {
       type: "ready",
       port: address.port,
       functions,
+    });
+  });
+}
+
+async function invokeHandler(req, res, handler, descriptor) {
+  installHttpCompatibilityHelpers(req, res);
+  if (descriptor.trigger.taskQueue) {
+    req.body = await readJsonBody(req);
+  }
+
+  try {
+    const result = handler(req, res);
+    if (result && typeof result.then === "function") {
+      await result;
+    }
+  } catch (error) {
+    if (!res.headersSent) {
+      res.statusCode = 500;
+    }
+    res.end(error && error.stack ? error.stack : String(error));
+  }
+}
+
+function installHttpCompatibilityHelpers(req, res) {
+  req.header ||= (name) => {
+    const value = req.headers[String(name).toLowerCase()];
+    return Array.isArray(value) ? value.join(", ") : value;
+  };
+  req.get ||= req.header;
+
+  res.status ||= (code) => {
+    res.statusCode = code;
+    return res;
+  };
+  res.send ||= (body) => {
+    if (body === undefined || body === null) {
+      res.end();
+      return res;
+    }
+    if (Buffer.isBuffer(body) || typeof body === "string") {
+      res.end(body);
+      return res;
+    }
+    if (!res.getHeader("content-type")) {
+      res.setHeader("content-type", "application/json; charset=utf-8");
+    }
+    res.end(JSON.stringify(body));
+    return res;
+  };
+  res.json ||= (body) => {
+    if (!res.getHeader("content-type")) {
+      res.setHeader("content-type", "application/json; charset=utf-8");
+    }
+    res.end(JSON.stringify(body));
+    return res;
+  };
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("error", reject);
+    req.on("end", () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(error);
+      }
     });
   });
 }
@@ -166,6 +234,10 @@ function describeFunction(entryId, value) {
     return null;
   }
 
+  if (value.__endpoint && value.__endpoint.platform === "gcfv2") {
+    return describeGen2(entryId, value.__endpoint);
+  }
+
   if (value.__trigger) {
     return describeGen1(entryId, value.__trigger, value);
   }
@@ -221,6 +293,7 @@ function describeGen1(entryId, trigger, value) {
       trigger: {
         type: "https",
         callable: false,
+        taskQueue: true,
       },
     };
   }
@@ -263,7 +336,7 @@ function describeGen1(entryId, trigger, value) {
 }
 
 function describeGen2(entryId, endpoint) {
-  const name = endpoint.id || endpoint.name || entryId;
+  const name = endpoint.id || endpoint.name || entryId.replace(/\./g, "-");
   const region = Array.isArray(endpoint.region) ? endpoint.region[0] : endpoint.region || "us-central1";
 
   if (endpoint.scheduleTrigger) {
@@ -300,6 +373,7 @@ function describeGen2(entryId, endpoint) {
       trigger: {
         type: "https",
         callable: false,
+        taskQueue: true,
       },
     };
   }

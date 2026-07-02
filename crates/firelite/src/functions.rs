@@ -1015,8 +1015,13 @@ exports.jobs = {
   run: (req, res) => res.end("task")
 };
 exports.jobs.run.__trigger = {
-  name: "jobs.run",
+  platform: "gcfv2",
   regions: ["us-central1"],
+  taskQueueTrigger: {}
+};
+exports.jobs.run.__endpoint = {
+  platform: "gcfv2",
+  region: ["us-central1"],
   taskQueueTrigger: {}
 };
 "#,
@@ -1025,8 +1030,71 @@ exports.jobs.run.__trigger = {
         let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
         assert!(worker.active.http_functions.contains_key(&FunctionKey {
             region: "us-central1".to_string(),
-            name: "jobs.run".to_string(),
+            name: "jobs-run".to_string(),
         }));
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invokes_task_queue_functions_with_parsed_json_body() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+exports.tasks = {
+  runJob: (req, res) => {
+    if (
+      req.body &&
+      req.body.data &&
+      req.body.data.jobTaskId === "task-1" &&
+      req.header("content-type").includes("application/json")
+    ) {
+      res.status(204).send();
+      return;
+    }
+    res.status(400).send({ body: req.body || null });
+  }
+};
+exports.tasks.runJob.__trigger = {
+  platform: "gcfv2",
+  regions: ["us-central1"],
+  taskQueueTrigger: {}
+};
+exports.tasks.runJob.__endpoint = {
+  platform: "gcfv2",
+  region: ["us-central1"],
+  taskQueueTrigger: {}
+};
+"#,
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
+        let state = Arc::new(FunctionsState {
+            project_id: "demo-firelite".to_string(),
+            active: Arc::new(RwLock::new(Some(worker.active.clone()))),
+            client: reqwest::Client::new(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .post(format!("{base_url}/demo-firelite/us-central1/tasks-runJob"))
+            .header("content-type", "application/json")
+            .body(r#"{"data":{"jobTaskId":"task-1"}}"#)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
         worker.child.kill().await.unwrap();
     }
 

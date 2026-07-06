@@ -1,6 +1,6 @@
 [package]
 name = "firelite"
-version = "0.2.2"
+version = "0.2.3"
 description = "A lightweight Firebase Emulator Suite-compatible local emulator for focused development workflows."
 edition.workspace = true
 license.workspace = true

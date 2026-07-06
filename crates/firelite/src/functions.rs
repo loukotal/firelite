@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
@@ -397,7 +398,7 @@ async fn start_worker(
     filters: &[String],
     generation: u64,
 ) -> anyhow::Result<StartedWorker> {
-    let worker_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/functions_worker.cjs");
+    let worker_path = materialize_functions_worker().await?;
     let mut child = Command::new("node")
         .arg(worker_path)
         .arg(source_dir)
@@ -455,6 +456,45 @@ async fn start_worker(
             http_functions,
         },
     })
+}
+
+const FUNCTIONS_WORKER: &[u8] = include_bytes!("functions_worker.cjs");
+
+async fn materialize_functions_worker() -> anyhow::Result<PathBuf> {
+    let mut hasher = Sha256::new();
+    hasher.update(FUNCTIONS_WORKER);
+    let hash = format!("{:x}", hasher.finalize());
+    let worker_dir = std::env::temp_dir().join("firelite");
+    let worker_path = worker_dir.join(format!(
+        "functions_worker-{}-{}.cjs",
+        env!("CARGO_PKG_VERSION"),
+        &hash[..16]
+    ));
+
+    tokio::fs::create_dir_all(&worker_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create worker asset directory {}",
+                worker_dir.display()
+            )
+        })?;
+
+    let needs_write = match tokio::fs::read(&worker_path).await {
+        Ok(existing) => existing != FUNCTIONS_WORKER,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read worker asset {}", worker_path.display()));
+        }
+    };
+    if needs_write {
+        tokio::fs::write(&worker_path, FUNCTIONS_WORKER)
+            .await
+            .with_context(|| format!("failed to write worker asset {}", worker_path.display()))?;
+    }
+
+    Ok(worker_path)
 }
 
 fn filter_descriptors(
@@ -1102,6 +1142,14 @@ exports.tasks.runJob.__endpoint = {
         assert!(should_watch_file(Path::new("index.ts")));
         assert!(should_watch_file(Path::new("src/index.tsx")));
         assert!(should_watch_file(Path::new("lib/index.js")));
+    }
+
+    #[tokio::test]
+    async fn materializes_embedded_worker_outside_cargo_source_dir() {
+        let worker_path = materialize_functions_worker().await.unwrap();
+        assert!(worker_path.exists());
+        assert_eq!(std::fs::read(&worker_path).unwrap(), FUNCTIONS_WORKER);
+        assert!(!worker_path.starts_with(env!("CARGO_MANIFEST_DIR")));
     }
 
     #[test]

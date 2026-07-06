@@ -149,6 +149,18 @@ npm run test:storage-sdk
 
 The harness starts Firelite on temporary loopback ports and verifies supported flows with the official Firebase Web and Admin SDK packages.
 
+## Release
+
+Releases are published by GitHub Actions when a GitHub Release is created. The repository must have a `CRATES_TOKEN` Actions secret.
+
+Use the release helper from a clean `main` branch:
+
+```sh
+scripts/release.sh 0.3.0
+```
+
+The script bumps the crate version, refreshes `Cargo.lock`, runs local checks, commits, tags `v0.3.0`, pushes `main` and the tag, and creates the GitHub Release that triggers publishing.
+
 ## Project Status
 
 Firelite is intentionally incomplete. See:

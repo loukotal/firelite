@@ -36,26 +36,66 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs: test
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-pc-windows-gnu
-            archive: zip
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            binary: firelite.exe
           - target: x86_64-unknown-linux-musl
-            archive: tar.gz tar.xz tar.zst
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            binary: firelite
           - target: x86_64-apple-darwin
-            archive: zip
+            os: macos-latest
+            archive_ext: zip
+            binary: firelite
     steps:
       - uses: actions/checkout@v4
-      - name: Compile and upload release artifact
-        uses: rust-build/rust-build.action@v1.4.3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build release binary
+        run: cargo build --package firelite --release --target "${{ matrix.target }}"
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        id: package-unix
+        shell: bash
+        run: |
+          archive="firelite-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "${archive}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${archive}/"
+          cp README.md LICENSE "${archive}/"
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            zip -r "${archive}.zip" "${archive}"
+            echo "artifact=${archive}.zip" >> "${GITHUB_OUTPUT}"
+          else
+            tar -czf "${archive}.tar.gz" "${archive}"
+            echo "artifact=${archive}.tar.gz" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        id: package-windows
+        shell: pwsh
+        run: |
+          $archive = "firelite-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $archive | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" "$archive\"
+          Copy-Item README.md, LICENSE "$archive\"
+          Compress-Archive -Path "$archive\*" -DestinationPath "$archive.zip" -Force
+          "artifact=$archive.zip" >> $env:GITHUB_OUTPUT
+      - name: Upload release artifact
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          SRC_DIR: "crates/firelite"
-          RUSTTARGET: ${{ matrix.target }}
-          ARCHIVE_TYPES: ${{ matrix.archive }}
-          EXTRA_FILES: "../../README.md ../../LICENSE"
+        shell: bash
+        run: |
+          artifact="${{ steps.package-unix.outputs.artifact }}${{ steps.package-windows.outputs.artifact }}"
+          gh release upload "${GITHUB_REF_NAME}" "${artifact}" --repo "${GITHUB_REPOSITORY}" --clobber

@@ -57,6 +57,7 @@ pub struct AuthState {
 struct ProjectAuthState {
     users_by_id: HashMap<String, UserRecord>,
     user_ids_by_email: HashMap<String, String>,
+    user_ids_by_phone: HashMap<String, String>,
     user_ids_by_provider: HashMap<(String, String), String>,
     oob_codes: HashMap<String, OobCodeRecord>,
 }
@@ -67,10 +68,13 @@ struct UserRecord {
     email: String,
     display_name: Option<String>,
     photo_url: Option<String>,
+    phone_number: Option<String>,
     custom_attributes: Option<String>,
     disabled: bool,
     email_verified: bool,
     password_hash: Option<String>,
+    valid_since_secs: u64,
+    mfa_info: Vec<MfaEnrollment>,
     providers: Vec<ProviderRecord>,
     created_at_ms: u64,
     last_login_at_ms: Option<u64>,
@@ -81,6 +85,27 @@ struct ProviderRecord {
     provider_id: String,
     raw_id: String,
     email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MfaEnrollment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mfa_enrollment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone_info: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unobfuscated_phone_info: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrolled_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MfaUpdate {
+    enrollments: Option<Vec<MfaEnrollment>>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,9 +199,11 @@ struct AdminCreateRequest {
     password: Option<String>,
     display_name: Option<String>,
     photo_url: Option<String>,
+    phone_number: Option<String>,
     custom_attributes: Option<String>,
     disabled: Option<bool>,
     email_verified: Option<bool>,
+    mfa_info: Option<Vec<MfaEnrollment>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,9 +212,16 @@ struct AdminUpdateRequest {
     local_id: String,
     display_name: Option<String>,
     photo_url: Option<String>,
+    phone_number: Option<String>,
     custom_attributes: Option<String>,
     disabled: Option<bool>,
+    disable_user: Option<bool>,
     email_verified: Option<bool>,
+    valid_since: Option<u64>,
+    delete_attribute: Option<Vec<String>>,
+    delete_provider: Option<Vec<String>>,
+    mfa: Option<MfaUpdate>,
+    mfa_info: Option<Vec<MfaEnrollment>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +229,7 @@ struct AdminUpdateRequest {
 struct AdminLookupRequest {
     local_id: Option<Vec<String>>,
     email: Option<Vec<String>>,
+    phone_number: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +321,8 @@ struct EmulatorUser {
     #[serde(skip_serializing_if = "Option::is_none")]
     photo_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    phone_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     custom_attributes: Option<String>,
     disabled: bool,
     email_verified: bool,
@@ -294,6 +331,8 @@ struct EmulatorUser {
     created_at: String,
     last_login_at: String,
     provider_user_info: Vec<ProviderInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mfa_info: Vec<MfaEnrollment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -349,12 +388,18 @@ async fn refresh_secure_token(
     if payload.grant_type != "refresh_token" {
         return Err(error(StatusCode::BAD_REQUEST, "UNSUPPORTED_GRANT_TYPE"));
     }
-    let (project_id, local_id) = parse_refresh_token(&payload.refresh_token)?;
+    let (project_id, local_id, issued_at) = parse_refresh_token(&payload.refresh_token)?;
     let projects = state.auth.projects.read().expect("auth state poisoned");
     let record = projects
         .get(&project_id)
         .and_then(|project| project.users_by_id.get(&local_id))
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if record.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    if issued_at < record.valid_since_secs {
+        return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+    }
     let id_token = make_token(&project_id, record);
     Ok(Json(SecureTokenResponse {
         access_token: id_token.clone(),
@@ -519,10 +564,13 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
         email: email.clone(),
         display_name: None,
         photo_url: None,
+        phone_number: None,
         custom_attributes: None,
         disabled: false,
         email_verified: false,
         password_hash: Some(hash_password(&payload.password)),
+        valid_since_secs: now / 1000,
+        mfa_info: Vec::new(),
         providers: vec![ProviderRecord {
             provider_id: "password".to_string(),
             raw_id: local_id,
@@ -568,16 +616,24 @@ fn admin_create_user(
     if project.user_ids_by_email.contains_key(&email_key) {
         return Err(error(StatusCode::BAD_REQUEST, "EMAIL_EXISTS"));
     }
+    let phone_number = payload.phone_number;
+    if let Some(phone_number) = &phone_number {
+        validate_phone_number_available(project, phone_number, None)?;
+    }
 
+    let now = now_ms();
     let record = UserRecord {
         local_id: local_id.clone(),
         email: email.clone(),
         display_name: payload.display_name,
         photo_url: payload.photo_url,
+        phone_number: phone_number.clone(),
         custom_attributes: payload.custom_attributes,
         disabled: payload.disabled.unwrap_or(false),
         email_verified: payload.email_verified.unwrap_or(false),
         password_hash: payload.password.as_deref().map(hash_password),
+        valid_since_secs: now / 1000,
+        mfa_info: normalize_mfa_enrollments(payload.mfa_info.unwrap_or_default()),
         providers: vec![ProviderRecord {
             provider_id: "password".to_string(),
             raw_id: local_id.clone(),
@@ -589,6 +645,11 @@ fn admin_create_user(
     project
         .user_ids_by_email
         .insert(email_key, local_id.clone());
+    if let Some(phone_number) = phone_number {
+        project
+            .user_ids_by_phone
+            .insert(phone_number, local_id.clone());
+    }
     project.users_by_id.insert(local_id.clone(), record);
     Ok(EmulatorUser::from(
         project.users_by_id.get(&local_id).expect("inserted user"),
@@ -604,24 +665,66 @@ fn admin_update_user(
     let Some(project) = projects.get_mut(project_id) else {
         return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
     };
-    let Some(record) = project.users_by_id.get_mut(&payload.local_id) else {
+    let local_id = payload.local_id;
+    if let Some(phone_number) = &payload.phone_number {
+        validate_phone_number_available(project, phone_number, Some(&local_id))?;
+    }
+
+    let Some(record) = project.users_by_id.get_mut(&local_id) else {
         return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
     };
 
+    if let Some(delete_attributes) = payload.delete_attribute {
+        for attribute in delete_attributes {
+            match attribute.as_str() {
+                "DISPLAY_NAME" => record.display_name = None,
+                "PHOTO_URL" => record.photo_url = None,
+                _ => {}
+            }
+        }
+    }
+    if let Some(delete_providers) = payload.delete_provider {
+        if delete_providers.iter().any(|provider| provider == "phone") {
+            if let Some(phone_number) = record.phone_number.take() {
+                project.user_ids_by_phone.remove(&phone_number);
+            }
+            record
+                .providers
+                .retain(|provider| provider.provider_id != "phone");
+        }
+    }
     if let Some(display_name) = payload.display_name {
         record.display_name = Some(display_name);
     }
     if let Some(photo_url) = payload.photo_url {
         record.photo_url = Some(photo_url);
     }
+    if let Some(phone_number) = payload.phone_number {
+        if let Some(old_phone_number) = record.phone_number.replace(phone_number.clone()) {
+            project.user_ids_by_phone.remove(&old_phone_number);
+        }
+        project
+            .user_ids_by_phone
+            .insert(phone_number.clone(), local_id.clone());
+        upsert_phone_provider(record, &phone_number);
+    }
     if let Some(custom_attributes) = payload.custom_attributes {
         record.custom_attributes = Some(custom_attributes);
     }
-    if let Some(disabled) = payload.disabled {
+    if let Some(disabled) = payload.disabled.or(payload.disable_user) {
         record.disabled = disabled;
     }
     if let Some(email_verified) = payload.email_verified {
         record.email_verified = email_verified;
+    }
+    if let Some(valid_since) = payload.valid_since {
+        record.valid_since_secs = valid_since;
+    }
+    if let Some(mfa) = payload.mfa {
+        record.mfa_info = normalize_mfa_enrollments(mfa.enrollments.unwrap_or_default());
+    }
+    if let Some(mfa_info) = payload.mfa_info {
+        record.mfa_info = normalize_mfa_enrollments(mfa_info);
     }
 
     Ok(EmulatorUser::from(&*record))
@@ -643,6 +746,9 @@ fn sign_in_with_password(
         return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
     };
 
+    if record.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
     if record.password_hash.as_deref() != Some(&hash_password(&payload.password)) {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_PASSWORD"));
     }
@@ -679,6 +785,15 @@ fn admin_lookup(
             emails
                 .into_iter()
                 .filter_map(|email| project.user_ids_by_email.get(&normalize_email(&email)))
+                .filter_map(|id| project.users_by_id.get(id))
+                .map(EmulatorUser::from),
+        );
+    }
+    if let Some(phone_numbers) = payload.phone_number {
+        users.extend(
+            phone_numbers
+                .into_iter()
+                .filter_map(|phone_number| project.user_ids_by_phone.get(&phone_number))
                 .filter_map(|id| project.users_by_id.get(id))
                 .map(EmulatorUser::from),
         );
@@ -752,6 +867,12 @@ fn lookup(state: &SharedState, payload: LookupRequest) -> Result<LookupResponse,
             .get(&claims.project_id)
             .and_then(|project| project.users_by_id.get(&claims.local_id))
         {
+            if record.disabled {
+                return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+            }
+            if claims.issued_at < record.valid_since_secs {
+                return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+            }
             users.push(EmulatorUser::from(record));
         }
     }
@@ -844,10 +965,13 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
                 email: email.clone(),
                 display_name: None,
                 photo_url: None,
+                phone_number: None,
                 custom_attributes: None,
                 disabled: false,
                 email_verified: false,
                 password_hash: None,
+                valid_since_secs: now_ms() / 1000,
+                mfa_info: Vec::new(),
                 providers: vec![ProviderRecord {
                     provider_id: provider_id.clone(),
                     raw_id: raw_id.clone(),
@@ -1028,6 +1152,9 @@ fn delete_account(auth: &AuthState, project_id: &str, local_id: &str) -> Result<
     project
         .user_ids_by_email
         .remove(&normalize_email(&record.email));
+    if let Some(phone_number) = record.phone_number {
+        project.user_ids_by_phone.remove(&phone_number);
+    }
     for provider in record.providers {
         project
             .user_ids_by_provider
@@ -1060,10 +1187,13 @@ fn get_or_create_user<'a>(
         email: email.clone(),
         display_name: None,
         photo_url: None,
+        phone_number: None,
         custom_attributes: None,
         disabled: false,
         email_verified: false,
         password_hash: None,
+        valid_since_secs: now_ms() / 1000,
+        mfa_info: Vec::new(),
         providers: vec![ProviderRecord {
             provider_id: provider_id.to_string(),
             raw_id: raw_id.to_string(),
@@ -1229,13 +1359,14 @@ fn auth_response(
 
 fn make_refresh_token(project_id: &str, local_id: &str) -> String {
     let payload = URL_SAFE_NO_PAD.encode(format!(
-        r#"{{"project_id":"{project_id}","local_id":"{local_id}","nonce":"{}"}}"#,
+        r#"{{"project_id":"{project_id}","local_id":"{local_id}","iat":{},"nonce":"{}"}}"#,
+        now_secs(),
         Uuid::new_v4()
     ));
     format!("firelite-refresh.{payload}")
 }
 
-fn parse_refresh_token(token: &str) -> Result<(String, String), AuthError> {
+fn parse_refresh_token(token: &str) -> Result<(String, String, u64), AuthError> {
     let Some(payload) = token.strip_prefix("firelite-refresh.") else {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"));
     };
@@ -1252,7 +1383,11 @@ fn parse_refresh_token(token: &str) -> Result<(String, String), AuthError> {
         .get("local_id")
         .and_then(|value| value.as_str())
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"))?;
-    Ok((project_id.to_string(), local_id.to_string()))
+    let issued_at = value
+        .get("iat")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    Ok((project_id.to_string(), local_id.to_string(), issued_at))
 }
 
 fn make_token(project_id: &str, record: &UserRecord) -> String {
@@ -1275,6 +1410,21 @@ fn make_token(project_id: &str, record: &UserRecord) -> String {
             }
         },
     });
+    if let Some(phone_number) = &record.phone_number {
+        let object = payload.as_object_mut().expect("token payload is an object");
+        object.insert("phone_number".to_string(), serde_json::json!(phone_number));
+        if let Some(firebase) = object
+            .get_mut("firebase")
+            .and_then(|value| value.as_object_mut())
+        {
+            if let Some(identities) = firebase
+                .get_mut("identities")
+                .and_then(|value| value.as_object_mut())
+            {
+                identities.insert("phone".to_string(), serde_json::json!([phone_number]));
+            }
+        }
+    }
     if let Some(custom_attributes) = &record.custom_attributes {
         if let Ok(serde_json::Value::Object(claims)) =
             serde_json::from_str::<serde_json::Value>(custom_attributes)
@@ -1293,6 +1443,7 @@ fn make_token(project_id: &str, record: &UserRecord) -> String {
 struct TokenClaims {
     project_id: String,
     local_id: String,
+    issued_at: u64,
 }
 
 fn parse_token_claims(token: &str) -> Result<TokenClaims, AuthError> {
@@ -1314,9 +1465,11 @@ fn parse_token_claims(token: &str) -> Result<TokenClaims, AuthError> {
         .and_then(|aud| aud.as_str())
         .map(ToOwned::to_owned)
         .unwrap_or_else(default_project_id);
+    let issued_at = value.get("iat").and_then(|iat| iat.as_u64()).unwrap_or(0);
     Ok(TokenClaims {
         project_id,
         local_id,
+        issued_at,
     })
 }
 
@@ -1328,6 +1481,64 @@ fn hash_password(password: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn validate_phone_number_available(
+    project: &ProjectAuthState,
+    phone_number: &str,
+    current_local_id: Option<&str>,
+) -> Result<(), AuthError> {
+    if let Some(existing_local_id) = project.user_ids_by_phone.get(phone_number) {
+        if Some(existing_local_id.as_str()) != current_local_id {
+            return Err(error(StatusCode::BAD_REQUEST, "PHONE_NUMBER_EXISTS"));
+        }
+    }
+    if !is_valid_phone_number(phone_number) {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_PHONE_NUMBER"));
+    }
+    Ok(())
+}
+
+fn is_valid_phone_number(phone_number: &str) -> bool {
+    let Some(rest) = phone_number.strip_prefix('+') else {
+        return false;
+    };
+    (1..=15).contains(&rest.len()) && rest.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn upsert_phone_provider(record: &mut UserRecord, phone_number: &str) {
+    if let Some(provider) = record
+        .providers
+        .iter_mut()
+        .find(|provider| provider.provider_id == "phone")
+    {
+        provider.raw_id = phone_number.to_string();
+        provider.email = String::new();
+        return;
+    }
+    record.providers.push(ProviderRecord {
+        provider_id: "phone".to_string(),
+        raw_id: phone_number.to_string(),
+        email: String::new(),
+    });
+}
+
+fn normalize_mfa_enrollments(enrollments: Vec<MfaEnrollment>) -> Vec<MfaEnrollment> {
+    enrollments
+        .into_iter()
+        .map(|mut enrollment| {
+            if enrollment.mfa_enrollment_id.is_none() {
+                enrollment.mfa_enrollment_id = Some(Uuid::new_v4().to_string());
+            }
+            if enrollment.enrolled_at.is_none() {
+                enrollment.enrolled_at = Some("1970-01-01T00:00:00.000Z".to_string());
+            }
+            if enrollment.unobfuscated_phone_info.is_none() {
+                enrollment.unobfuscated_phone_info = enrollment.phone_info.clone();
+            }
+            enrollment
+        })
+        .collect()
 }
 
 fn now_ms() -> u64 {
@@ -1372,11 +1583,12 @@ impl From<&UserRecord> for EmulatorUser {
             email: record.email.clone(),
             display_name: record.display_name.clone(),
             photo_url: record.photo_url.clone(),
+            phone_number: record.phone_number.clone(),
             custom_attributes: record.custom_attributes.clone(),
             disabled: record.disabled,
             email_verified: record.email_verified,
             password_hash: record.password_hash.clone().unwrap_or_default(),
-            valid_since: (record.created_at_ms / 1000).to_string(),
+            valid_since: record.valid_since_secs.to_string(),
             created_at: record.created_at_ms.to_string(),
             last_login_at: record
                 .last_login_at_ms
@@ -1391,6 +1603,7 @@ impl From<&UserRecord> for EmulatorUser {
                     email: provider.email.clone(),
                 })
                 .collect(),
+            mfa_info: record.mfa_info.clone(),
         }
     }
 }

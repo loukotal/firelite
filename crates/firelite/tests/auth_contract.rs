@@ -237,6 +237,284 @@ async fn auth_admin_update_custom_claims_are_in_new_id_tokens() {
 }
 
 #[tokio::test]
+async fn auth_secure_token_refresh_sees_updated_custom_claims() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "refresh-claims@example.test",
+            "password": "secret123"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let signed_in: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "refresh-claims@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "localId": created["localId"].as_str().unwrap(),
+            "customAttributes": "{\"admin\":true}"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let refreshed: Value = client
+        .post(format!(
+            "{base_url}/securetoken.googleapis.com/v1/token?key=fake"
+        ))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                signed_in["refreshToken"].as_str().expect("refresh token"),
+            ),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token_payload = decode_jwt_payload(refreshed["id_token"].as_str().unwrap());
+    assert_eq!(token_payload["admin"], true);
+}
+
+#[tokio::test]
+async fn auth_admin_update_persists_phone_disabled_and_mfa() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "mfa@example.test",
+            "password": "secret123"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let updated: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "localId": created["localId"].as_str().unwrap(),
+            "phoneNumber": "+15555550100",
+            "disableUser": true,
+            "mfa": {
+                "enrollments": [{
+                    "mfaEnrollmentId": "factor-1",
+                    "displayName": "phone",
+                    "phoneInfo": "+15555550101",
+                    "enrolledAt": "2026-01-01T00:00:00.000Z"
+                }]
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(updated["phoneNumber"], "+15555550100");
+    assert_eq!(updated["disabled"], true);
+    assert_eq!(updated["mfaInfo"][0]["mfaEnrollmentId"], "factor-1");
+    assert_eq!(updated["mfaInfo"][0]["phoneInfo"], "+15555550101");
+
+    let lookup: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:lookup?key=fake"
+        ))
+        .json(&json!({
+            "phoneNumber": ["+15555550100"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lookup["users"][0]["localId"], created["localId"]);
+    assert_eq!(
+        lookup["users"][0]["mfaInfo"][0]["mfaEnrollmentId"],
+        "factor-1"
+    );
+}
+
+#[tokio::test]
+async fn auth_duplicate_phone_returns_phone_exists_before_invalid_phone() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "phone-one@example.test",
+            "password": "secret123",
+            "phoneNumber": "+15555550111"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let duplicate = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "phone-two@example.test",
+            "password": "secret123",
+            "phoneNumber": "+15555550111"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    let body: Value = duplicate.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "PHONE_NUMBER_EXISTS");
+}
+
+#[tokio::test]
+async fn auth_revoke_refresh_tokens_invalidates_old_id_and_refresh_tokens() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "revoked@example.test",
+            "password": "secret123"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let signed_in: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "revoked@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "localId": created["localId"].as_str().unwrap(),
+            "validSince": 4_102_444_800_u64
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let lookup = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=fake"
+        ))
+        .json(&json!({
+            "idToken": signed_in["idToken"].as_str().unwrap()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lookup.status(), StatusCode::BAD_REQUEST);
+    let lookup_body: Value = lookup.json().await.unwrap();
+    assert_eq!(lookup_body["error"]["message"], "TOKEN_EXPIRED");
+
+    let refresh = client
+        .post(format!(
+            "{base_url}/securetoken.googleapis.com/v1/token?key=fake"
+        ))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                signed_in["refreshToken"].as_str().expect("refresh token"),
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refresh.status(), StatusCode::BAD_REQUEST);
+    let refresh_body: Value = refresh.json().await.unwrap();
+    assert_eq!(refresh_body["error"]["message"], "TOKEN_EXPIRED");
+}
+
+#[tokio::test]
 async fn auth_password_sign_in_finds_admin_created_user_project() {
     let base_url = spawn_app().await;
     let client = reqwest::Client::new();

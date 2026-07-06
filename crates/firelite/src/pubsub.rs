@@ -20,7 +20,20 @@ type SharedState = Arc<AppState>;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
+        .route(
+            "/google.pubsub.v1.Publisher/CreateTopic",
+            post(grpc_create_topic),
+        )
         .route("/google.pubsub.v1.Publisher/Publish", post(grpc_publish))
+        .route(
+            "/google.pubsub.v1.Subscriber/CreateSubscription",
+            post(grpc_create_subscription),
+        )
+        .route("/google.pubsub.v1.Subscriber/Pull", post(grpc_pull))
+        .route(
+            "/google.pubsub.v1.Subscriber/Acknowledge",
+            post(grpc_acknowledge),
+        )
         .route("/v1/projects/:project_id/topics", get(list_topics))
         .route(
             "/v1/projects/:project_id/topics/:topic",
@@ -319,6 +332,137 @@ async fn grpc_publish(State(state): State<SharedState>, body: Bytes) -> Response
         .map(|response| encode_publish_response(&response.message_ids))
     {
         Ok(payload) => grpc_response(payload),
+        Err(err) => grpc_error_response(err),
+    }
+}
+
+async fn grpc_create_topic(State(state): State<SharedState>, body: Bytes) -> Response {
+    match decode_grpc_topic_request(&body)
+        .and_then(|request| {
+            let (project_id, topic_name) = parse_topic_name(&request.name)
+                .ok_or_else(|| GrpcError::new(3, "invalid topic name"))?;
+            let mut projects = state
+                .pubsub
+                .projects
+                .write()
+                .expect("pubsub state poisoned");
+            let project = projects.entry(project_id).or_default();
+            let record = project.topics.entry(topic_name.clone()).or_default();
+            record.labels = request.labels;
+            Ok(encode_topic_response(&topic_name, record))
+        })
+        .map(grpc_response)
+    {
+        Ok(response) => response,
+        Err(err) => grpc_error_response(err),
+    }
+}
+
+async fn grpc_create_subscription(State(state): State<SharedState>, body: Bytes) -> Response {
+    match decode_grpc_subscription_request(&body)
+        .and_then(|request| {
+            let (project_id, subscription_id) = parse_subscription_name(&request.name)
+                .ok_or_else(|| GrpcError::new(3, "invalid subscription name"))?;
+            let topic = normalize_topic_name(&project_id, &request.topic);
+            let mut projects = state
+                .pubsub
+                .projects
+                .write()
+                .expect("pubsub state poisoned");
+            let project = projects.entry(project_id.clone()).or_default();
+            project
+                .topics
+                .entry(topic.clone())
+                .or_insert_with(TopicRecord::default);
+            let record = SubscriptionRecord {
+                topic,
+                ack_deadline_seconds: request.ack_deadline_seconds.unwrap_or(10),
+                pending: VecDeque::new(),
+                outstanding: BTreeMap::new(),
+            };
+            let subscription_name = subscription_name(&project_id, &subscription_id);
+            project
+                .subscriptions
+                .insert(subscription_name.clone(), record.clone());
+            Ok(encode_subscription_response(&subscription_name, &record))
+        })
+        .map(grpc_response)
+    {
+        Ok(response) => response,
+        Err(err) => grpc_error_response(err),
+    }
+}
+
+async fn grpc_pull(State(state): State<SharedState>, body: Bytes) -> Response {
+    match decode_grpc_pull_request(&body)
+        .and_then(|request| {
+            let (project_id, subscription_id) = parse_subscription_name(&request.subscription)
+                .ok_or_else(|| GrpcError::new(3, "invalid subscription name"))?;
+            let subscription_name = subscription_name(&project_id, &subscription_id);
+            let max_messages = request.max_messages.unwrap_or(1).max(1) as usize;
+            let mut projects = state
+                .pubsub
+                .projects
+                .write()
+                .expect("pubsub state poisoned");
+            let project = projects
+                .get_mut(&project_id)
+                .ok_or_else(|| GrpcError::new(5, "SUBSCRIPTION_NOT_FOUND"))?;
+            let mut received_messages = Vec::new();
+            for _ in 0..max_messages {
+                let message = {
+                    let subscription = project
+                        .subscriptions
+                        .get_mut(&subscription_name)
+                        .ok_or_else(|| GrpcError::new(5, "SUBSCRIPTION_NOT_FOUND"))?;
+                    subscription.pending.pop_front()
+                };
+                let Some(message) = message else {
+                    break;
+                };
+                project.next_ack_id += 1;
+                let ack_id = format!("ack-{}", project.next_ack_id);
+                let subscription = project
+                    .subscriptions
+                    .get_mut(&subscription_name)
+                    .ok_or_else(|| GrpcError::new(5, "SUBSCRIPTION_NOT_FOUND"))?;
+                subscription
+                    .outstanding
+                    .insert(ack_id.clone(), message.clone());
+                received_messages.push(ReceivedMessage { ack_id, message });
+            }
+            Ok(encode_pull_response(&received_messages))
+        })
+        .map(grpc_response)
+    {
+        Ok(response) => response,
+        Err(err) => grpc_error_response(err),
+    }
+}
+
+async fn grpc_acknowledge(State(state): State<SharedState>, body: Bytes) -> Response {
+    match decode_grpc_acknowledge_request(&body)
+        .and_then(|request| {
+            let (project_id, subscription_id) = parse_subscription_name(&request.subscription)
+                .ok_or_else(|| GrpcError::new(3, "invalid subscription name"))?;
+            let subscription_name = subscription_name(&project_id, &subscription_id);
+            let mut projects = state
+                .pubsub
+                .projects
+                .write()
+                .expect("pubsub state poisoned");
+            let subscription = projects
+                .get_mut(&project_id)
+                .and_then(|project| project.subscriptions.get_mut(&subscription_name))
+                .ok_or_else(|| GrpcError::new(5, "SUBSCRIPTION_NOT_FOUND"))?;
+            for ack_id in request.ack_ids {
+                subscription.outstanding.remove(&ack_id);
+            }
+            Ok(Vec::new())
+        })
+        .map(grpc_response)
+    {
+        Ok(response) => response,
         Err(err) => grpc_error_response(err),
     }
 }
@@ -646,6 +790,26 @@ fn parse_topic_name(topic: &str) -> Option<(String, String)> {
     }
 }
 
+fn parse_subscription_name(subscription: &str) -> Option<(String, String)> {
+    let mut parts = subscription.split('/');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (
+            Some("projects"),
+            Some(project_id),
+            Some("subscriptions"),
+            Some(subscription_id),
+            None,
+        ) => Some((project_id.to_string(), subscription_id.to_string())),
+        _ => None,
+    }
+}
+
 fn subscription_name(project_id: &str, subscription: &str) -> String {
     format!("projects/{project_id}/subscriptions/{subscription}")
 }
@@ -665,6 +829,31 @@ fn error(status: StatusCode, message: &'static str) -> PubsubError {
 struct GrpcPublishRequest {
     topic: String,
     messages: Vec<PublishMessage>,
+}
+
+#[derive(Debug)]
+struct GrpcTopicRequest {
+    name: String,
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct GrpcSubscriptionRequest {
+    name: String,
+    topic: String,
+    ack_deadline_seconds: Option<i32>,
+}
+
+#[derive(Debug)]
+struct GrpcPullRequest {
+    subscription: String,
+    max_messages: Option<i32>,
+}
+
+#[derive(Debug)]
+struct GrpcAcknowledgeRequest {
+    subscription: String,
+    ack_ids: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -694,6 +883,110 @@ impl From<PubsubError> for GrpcError {
 }
 
 fn decode_grpc_publish_request(body: &[u8]) -> Result<GrpcPublishRequest, GrpcError> {
+    decode_publish_request_message(decode_grpc_frame(body)?)
+}
+
+fn decode_grpc_topic_request(body: &[u8]) -> Result<GrpcTopicRequest, GrpcError> {
+    let bytes = decode_grpc_frame(body)?;
+    let mut cursor = 0;
+    let mut name = None;
+    let mut labels = BTreeMap::new();
+
+    while cursor < bytes.len() {
+        let tag = read_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field, wire_type) {
+            (1, 2) => name = Some(read_string(bytes, &mut cursor)?),
+            (2, 2) => {
+                let entry = read_len_delimited(bytes, &mut cursor)?;
+                if let Some((key, value)) = decode_string_map_entry(entry)? {
+                    labels.insert(key, value);
+                }
+            }
+            _ => skip_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(GrpcTopicRequest {
+        name: name.ok_or_else(|| GrpcError::new(3, "missing topic name"))?,
+        labels,
+    })
+}
+
+fn decode_grpc_subscription_request(body: &[u8]) -> Result<GrpcSubscriptionRequest, GrpcError> {
+    let bytes = decode_grpc_frame(body)?;
+    let mut cursor = 0;
+    let mut name = None;
+    let mut topic = None;
+    let mut ack_deadline_seconds = None;
+
+    while cursor < bytes.len() {
+        let tag = read_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field, wire_type) {
+            (1, 2) => name = Some(read_string(bytes, &mut cursor)?),
+            (2, 2) => topic = Some(read_string(bytes, &mut cursor)?),
+            (5, 0) => ack_deadline_seconds = Some(read_varint(bytes, &mut cursor)? as i32),
+            _ => skip_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(GrpcSubscriptionRequest {
+        name: name.ok_or_else(|| GrpcError::new(3, "missing subscription name"))?,
+        topic: topic.ok_or_else(|| GrpcError::new(3, "missing subscription topic"))?,
+        ack_deadline_seconds,
+    })
+}
+
+fn decode_grpc_pull_request(body: &[u8]) -> Result<GrpcPullRequest, GrpcError> {
+    let bytes = decode_grpc_frame(body)?;
+    let mut cursor = 0;
+    let mut subscription = None;
+    let mut max_messages = None;
+
+    while cursor < bytes.len() {
+        let tag = read_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field, wire_type) {
+            (1, 2) => subscription = Some(read_string(bytes, &mut cursor)?),
+            (3, 0) => max_messages = Some(read_varint(bytes, &mut cursor)? as i32),
+            _ => skip_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(GrpcPullRequest {
+        subscription: subscription.ok_or_else(|| GrpcError::new(3, "missing subscription"))?,
+        max_messages,
+    })
+}
+
+fn decode_grpc_acknowledge_request(body: &[u8]) -> Result<GrpcAcknowledgeRequest, GrpcError> {
+    let bytes = decode_grpc_frame(body)?;
+    let mut cursor = 0;
+    let mut subscription = None;
+    let mut ack_ids = Vec::new();
+
+    while cursor < bytes.len() {
+        let tag = read_varint(bytes, &mut cursor)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field, wire_type) {
+            (1, 2) => subscription = Some(read_string(bytes, &mut cursor)?),
+            (2, 2) => ack_ids.push(read_string(bytes, &mut cursor)?),
+            _ => skip_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+
+    Ok(GrpcAcknowledgeRequest {
+        subscription: subscription.ok_or_else(|| GrpcError::new(3, "missing subscription"))?,
+        ack_ids,
+    })
+}
+
+fn decode_grpc_frame(body: &[u8]) -> Result<&[u8], GrpcError> {
     if body.len() < 5 {
         return Err(GrpcError::new(3, "missing grpc frame"));
     }
@@ -711,7 +1004,7 @@ fn decode_grpc_publish_request(body: &[u8]) -> Result<GrpcPublishRequest, GrpcEr
         return Err(GrpcError::new(3, "truncated grpc frame"));
     }
 
-    decode_publish_request_message(&body[5..end])
+    Ok(&body[5..end])
 }
 
 fn decode_publish_request_message(bytes: &[u8]) -> Result<GrpcPublishRequest, GrpcError> {
@@ -857,10 +1150,68 @@ fn encode_publish_response(message_ids: &[String]) -> Vec<u8> {
     payload
 }
 
+fn encode_topic_response(name: &str, topic: &TopicRecord) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_len_delimited_field(&mut payload, 1, name.as_bytes());
+    for (key, value) in &topic.labels {
+        let mut entry = Vec::new();
+        write_len_delimited_field(&mut entry, 1, key.as_bytes());
+        write_len_delimited_field(&mut entry, 2, value.as_bytes());
+        write_len_delimited_field(&mut payload, 2, &entry);
+    }
+    payload
+}
+
+fn encode_subscription_response(name: &str, subscription: &SubscriptionRecord) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_len_delimited_field(&mut payload, 1, name.as_bytes());
+    write_len_delimited_field(&mut payload, 2, subscription.topic.as_bytes());
+    write_varint_field(
+        &mut payload,
+        5,
+        subscription.ack_deadline_seconds.max(0) as u64,
+    );
+    payload
+}
+
+fn encode_pull_response(received_messages: &[ReceivedMessage]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for received in received_messages {
+        let mut received_payload = Vec::new();
+        write_len_delimited_field(&mut received_payload, 1, received.ack_id.as_bytes());
+        let message_payload = encode_grpc_pubsub_message(&received.message);
+        write_len_delimited_field(&mut received_payload, 2, &message_payload);
+        write_len_delimited_field(&mut payload, 1, &received_payload);
+    }
+    payload
+}
+
+fn encode_grpc_pubsub_message(message: &PubsubMessage) -> Vec<u8> {
+    let mut payload = Vec::new();
+    let data = BASE64.decode(&message.data).unwrap_or_default();
+    write_len_delimited_field(&mut payload, 1, &data);
+    for (key, value) in &message.attributes {
+        let mut entry = Vec::new();
+        write_len_delimited_field(&mut entry, 1, key.as_bytes());
+        write_len_delimited_field(&mut entry, 2, value.as_bytes());
+        write_len_delimited_field(&mut payload, 2, &entry);
+    }
+    write_len_delimited_field(&mut payload, 3, message.message_id.as_bytes());
+    if let Some(ordering_key) = &message.ordering_key {
+        write_len_delimited_field(&mut payload, 5, ordering_key.as_bytes());
+    }
+    payload
+}
+
 fn write_len_delimited_field(out: &mut Vec<u8>, field: u64, value: &[u8]) {
     write_varint(out, (field << 3) | 2);
     write_varint(out, value.len() as u64);
     out.extend_from_slice(value);
+}
+
+fn write_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    write_varint(out, field << 3);
+    write_varint(out, value);
 }
 
 fn write_varint(out: &mut Vec<u8>, mut value: u64) {

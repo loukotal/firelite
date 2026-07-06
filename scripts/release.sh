@@ -9,7 +9,7 @@ Prepares and starts a Firelite release:
   1. verifies the working tree is clean and on main
   2. bumps crates/firelite/Cargo.toml to <version>
   3. refreshes Cargo.lock
-  4. runs fmt, clippy, tests, package verification, and Admin SDK harness
+  4. runs fmt, clippy, tests, package verification, and SDK harnesses
   5. commits, tags v<version>, pushes main and tag
   6. creates a GitHub Release, which triggers .github/workflows/release.yml
 
@@ -131,6 +131,7 @@ run cargo test --workspace
 run cargo package --package firelite --allow-dirty
 if [[ "${SKIP_HARNESS}" != "1" ]]; then
   run node harness/src/test-auth-admin-sdk.mjs
+  run node harness/src/test-pubsub-sdk.mjs
 fi
 
 run git add Cargo.lock crates/firelite/Cargo.toml

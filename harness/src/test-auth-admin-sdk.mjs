@@ -56,6 +56,66 @@ try {
   assert.equal(byEmail.uid, uid);
   assert.equal(byEmail.email, email);
 
+  const phoneNumber = "+15555550123";
+  const updated = await auth.updateUser(uid, {
+    phoneNumber,
+    disabled: true,
+    multiFactor: {
+      enrolledFactors: [
+        {
+          uid: "factor-admin-sdk",
+          factorId: "phone",
+          phoneNumber: "+15555550124",
+          displayName: "Admin SDK phone",
+          enrollmentTime: "Tue, 01 Jan 2030 00:00:00 GMT"
+        }
+      ]
+    }
+  });
+  assert.equal(updated.phoneNumber, phoneNumber);
+  assert.equal(updated.disabled, true);
+  assert.equal(updated.multiFactor.enrolledFactors.length, 1);
+  assert.equal(updated.multiFactor.enrolledFactors[0].uid, "factor-admin-sdk");
+  assert.equal(updated.multiFactor.enrolledFactors[0].phoneNumber, "+15555550124");
+
+  const byPhone = await auth.getUserByPhoneNumber(phoneNumber);
+  assert.equal(byPhone.uid, uid);
+  assert.equal(byPhone.multiFactor.enrolledFactors[0].uid, "factor-admin-sdk");
+
+  await assert.rejects(
+    () =>
+      auth.createUser({
+        uid: `${uid}-dupe-phone`,
+        email: `${uid}-dupe-phone@example.test`,
+        phoneNumber
+      }),
+    (error) => error.code === "auth/phone-number-already-exists"
+  );
+
+  await auth.updateUser(uid, { disabled: false });
+  const signIn = await fetch(
+    `${baseUrl}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email,
+        password: "secret123",
+        returnSecureToken: true
+      })
+    }
+  );
+  assert.equal(signIn.ok, true);
+  const signInBody = await signIn.json();
+  await sleep(1100);
+  await auth.revokeRefreshTokens(uid);
+  const revoked = await auth.getUser(uid);
+  assert.ok(revoked.tokensValidAfterTime);
+  await assert.rejects(
+    () => auth.verifyIdToken(signInBody.idToken, true),
+    (error) => error.code === "auth/id-token-revoked"
+  );
+
   const resetLink = await auth.generatePasswordResetLink(email);
   assert.match(resetLink, /mode=resetPassword/);
   assert.match(resetLink, /oobCode=firelite-oob-/);

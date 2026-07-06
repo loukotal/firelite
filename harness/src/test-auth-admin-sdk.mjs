@@ -56,6 +56,10 @@ try {
   assert.equal(byEmail.uid, uid);
   assert.equal(byEmail.email, email);
 
+  const resetLink = await auth.generatePasswordResetLink(email);
+  assert.match(resetLink, /mode=resetPassword/);
+  assert.match(resetLink, /oobCode=firelite-oob-/);
+
   const listed = await auth.listUsers(100);
   assert.ok(listed.users.some((user) => user.uid === uid));
 

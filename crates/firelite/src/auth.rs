@@ -145,6 +145,7 @@ struct SendOobCodeRequest {
     request_type: String,
     email: String,
     continue_url: Option<String>,
+    return_oob_link: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +234,8 @@ struct SecureTokenResponse {
 struct OobCodeResponse {
     email: String,
     oob_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oob_link: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -386,7 +389,7 @@ async fn identity_action(
         }
         "accounts:sendOobCode" => {
             let payload = parse_payload(payload)?;
-            serde_json::to_value(send_oob_code(&state, payload)?)
+            serde_json::to_value(send_oob_code(&state, &default_project_id(), payload)?)
         }
         "accounts:signInWithEmailLink" => {
             let payload = parse_payload(payload)?;
@@ -419,6 +422,10 @@ async fn identity_action(
                             payload,
                         )?)
                     }
+                    "accounts:sendOobCode" => {
+                        let payload = parse_payload(payload)?;
+                        serde_json::to_value(send_oob_code(&state, &project_id, payload)?)
+                    }
                     _ => return Err(error(StatusCode::NOT_FOUND, "NOT_FOUND")),
                 }
             } else {
@@ -447,7 +454,7 @@ async fn identity_get_action(
 fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, AuthError> {
     let project_id = default_project_id();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.clone()).or_default();
+    let project = projects.entry(project_id.to_string()).or_default();
     let email_key = normalize_email(&payload.email);
 
     if project.user_ids_by_email.contains_key(&email_key) {
@@ -578,7 +585,7 @@ fn sign_in_with_password(
 ) -> Result<AuthResponse, AuthError> {
     let project_id = project_id_for_email(&state.auth, &payload.email);
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.clone()).or_default();
+    let project = projects.entry(project_id.to_string()).or_default();
     let email_key = normalize_email(&payload.email);
     let Some(local_id) = project.user_ids_by_email.get(&email_key).cloned() else {
         return Err(error(StatusCode::BAD_REQUEST, "EMAIL_NOT_FOUND"));
@@ -825,9 +832,10 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
 
 fn send_oob_code(
     state: &SharedState,
+    project_id: &str,
     payload: SendOobCodeRequest,
 ) -> Result<OobCodeResponse, AuthError> {
-    if payload.request_type != "EMAIL_SIGNIN" {
+    if payload.request_type != "EMAIL_SIGNIN" && payload.request_type != "PASSWORD_RESET" {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "UNSUPPORTED_OOB_REQUEST_TYPE",
@@ -835,22 +843,33 @@ fn send_oob_code(
     }
 
     let _continue_url = payload.continue_url.as_deref().unwrap_or("");
-    let project_id = default_project_id();
     let code = format!("firelite-oob-{}", Uuid::new_v4());
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
-    let project = projects.entry(project_id.clone()).or_default();
+    let project = projects.entry(project_id.to_string()).or_default();
+    if payload.request_type == "PASSWORD_RESET"
+        && !project
+            .user_ids_by_email
+            .contains_key(&normalize_email(&payload.email))
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "EMAIL_NOT_FOUND"));
+    }
     project.oob_codes.insert(
         code.clone(),
         OobCodeRecord {
             email: payload.email.clone(),
-            request_type: payload.request_type,
+            request_type: payload.request_type.clone(),
             created_at_ms: now_ms(),
         },
     );
+    let oob_link = payload
+        .return_oob_link
+        .unwrap_or(false)
+        .then(|| make_oob_link(project_id, &payload.request_type, &code));
 
     Ok(OobCodeResponse {
         email: payload.email,
         oob_code: code,
+        oob_link,
     })
 }
 
@@ -1027,6 +1046,31 @@ fn parse_project_action(action: &str) -> Option<(String, &str)> {
         return None;
     }
     Some((project_id.to_string(), admin_action))
+}
+
+fn make_oob_link(project_id: &str, request_type: &str, oob_code: &str) -> String {
+    let mode = match request_type {
+        "PASSWORD_RESET" => "resetPassword",
+        "EMAIL_SIGNIN" => "signIn",
+        _ => "action",
+    };
+    format!(
+        "http://localhost:9099/emulator/action?mode={mode}&oobCode={}&projectId={}",
+        percent_encode_query(oob_code),
+        percent_encode_query(project_id)
+    )
+}
+
+fn percent_encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn parse_custom_token_subject(token: &str) -> Result<String, AuthError> {

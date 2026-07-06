@@ -463,6 +463,82 @@ async fn auth_email_link_oob_flow_signs_in_user_once() {
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn auth_admin_password_reset_link_creates_oob_link() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+    let email = "reset@example.test";
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "localId": "reset-user",
+            "email": email,
+            "password": "secret123"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let sent: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:sendOobCode?key=fake"
+        ))
+        .json(&json!({
+            "requestType": "PASSWORD_RESET",
+            "email": email,
+            "returnOobLink": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let oob_code = sent["oobCode"].as_str().unwrap();
+    let oob_link = sent["oobLink"].as_str().unwrap();
+    assert_eq!(sent["email"], email);
+    assert!(oob_link.contains("mode=resetPassword"));
+    assert!(oob_link.contains(&format!("oobCode={oob_code}")));
+
+    let listed: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/oobCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed_code = &listed["oobCodes"].as_array().unwrap()[0];
+    assert_eq!(listed_code["email"], email);
+    assert_eq!(listed_code["oobCode"], oob_code);
+    assert_eq!(listed_code["requestType"], "PASSWORD_RESET");
+
+    let missing = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:sendOobCode?key=fake"
+        ))
+        .json(&json!({
+            "requestType": "PASSWORD_RESET",
+            "email": "missing@example.test",
+            "returnOobLink": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+}
+
 async fn spawn_app() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -3,19 +3,21 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 const DEFAULT_PROJECT: &str = "demo-firelite";
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -24,7 +26,15 @@ type SharedState = Arc<AppState>;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        .route("/upload/storage/v1/b/:bucket/o", post(upload_gcs_object))
+        .route(
+            "/upload/storage/v1/b/:bucket/o",
+            post(upload_gcs_object).put(upload_gcs_resumable_chunk),
+        )
+        .route("/b/:bucket/o", get(list_gcs_objects))
+        .route(
+            "/b/:bucket/o/*object",
+            get(get_gcs_object).delete(delete_gcs_object),
+        )
         .route("/storage/v1/b/:bucket/o", get(list_gcs_objects))
         .route(
             "/storage/v1/b/:bucket/o/*object",
@@ -47,6 +57,7 @@ pub fn router() -> Router<SharedState> {
 #[derive(Debug, Clone, Default)]
 pub struct StorageState {
     projects: Arc<RwLock<HashMap<String, ProjectStorageState>>>,
+    resumable_uploads: Arc<RwLock<HashMap<String, ResumableUploadSession>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,11 +80,21 @@ struct ObjectRecord {
     updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ResumableUploadSession {
+    project_id: String,
+    bucket: String,
+    name: String,
+    content_type: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadQuery {
     name: Option<String>,
     upload_type: Option<String>,
+    #[serde(alias = "upload_id")]
+    upload_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +128,7 @@ struct ObjectMetadata {
     metageneration: String,
     size: String,
     content_type: String,
+    crc32c: String,
     time_created: String,
     updated: String,
 }
@@ -160,13 +182,63 @@ async fn upload_gcs_object(
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
     body: Bytes,
-) -> StorageResult<ObjectMetadata> {
+) -> Result<Response, StorageError> {
+    if query.upload_type.as_deref() == Some("resumable") {
+        return start_resumable_upload(&state, &bucket, query.name, headers, body);
+    }
     if matches!(query.upload_type.as_deref(), Some(value) if value != "media" && value != "multipart")
     {
         return Err(error(StatusCode::BAD_REQUEST, "UNSUPPORTED_UPLOAD_TYPE"));
     }
     let upload = parse_upload(query.name, headers, body)?;
-    upload_object(&state, &infer_project_id(&bucket), &bucket, upload)
+    Ok(upload_object(&state, &infer_project_id(&bucket), &bucket, upload)?.into_response())
+}
+
+async fn upload_gcs_resumable_chunk(
+    State(state): State<SharedState>,
+    Path(bucket): Path<String>,
+    Query(query): Query<UploadQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StorageError> {
+    if query.upload_type.as_deref() != Some("resumable") {
+        return Err(error(StatusCode::BAD_REQUEST, "UNSUPPORTED_UPLOAD_TYPE"));
+    }
+    let upload_id = query
+        .upload_id
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_UPLOAD_ID"))?;
+    let session = state
+        .storage
+        .resumable_uploads
+        .write()
+        .expect("storage state poisoned")
+        .remove(&upload_id)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "UPLOAD_SESSION_NOT_FOUND"))?;
+    if session.bucket != bucket {
+        return Err(error(StatusCode::NOT_FOUND, "UPLOAD_SESSION_NOT_FOUND"));
+    }
+    if is_resumable_status_query(&headers, &body) {
+        state
+            .storage
+            .resumable_uploads
+            .write()
+            .expect("storage state poisoned")
+            .insert(upload_id, session);
+        return Ok(StatusCode::PERMANENT_REDIRECT.into_response());
+    }
+
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&session.content_type)
+        .to_string();
+    let upload = ParsedUpload {
+        name: session.name,
+        content_type,
+        data: body,
+    };
+    Ok(upload_object(&state, &session.project_id, &session.bucket, upload)?.into_response())
 }
 
 async fn upload_firebase_object(
@@ -247,6 +319,72 @@ async fn reset_emulator_bucket(
         project.buckets.remove(&bucket);
     }
     Ok(Json(EmptyResponse {}))
+}
+
+fn start_resumable_upload(
+    state: &SharedState,
+    bucket: &str,
+    query_name: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StorageError> {
+    let metadata: Option<UploadMetadata> = if body.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_slice(&body)
+                .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_RESUMABLE_METADATA"))?,
+        )
+    };
+    let name = query_name
+        .or_else(|| metadata.as_ref().and_then(|value| value.name.clone()))
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_OBJECT_NAME"))?;
+    let content_type = headers
+        .get("x-upload-content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .or_else(|| metadata.and_then(|value| value.content_type))
+        .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string());
+    let upload_id = Uuid::new_v4().to_string();
+    let project_id = infer_project_id(bucket);
+
+    state
+        .storage
+        .resumable_uploads
+        .write()
+        .expect("storage state poisoned")
+        .insert(
+            upload_id.clone(),
+            ResumableUploadSession {
+                project_id,
+                bucket: bucket.to_string(),
+                name,
+                content_type,
+            },
+        );
+
+    let location = format!(
+        "{}/upload/storage/v1/b/{}/o?uploadType=resumable&upload_id={}",
+        request_base_url(&headers),
+        percent_encode_path_segment(bucket),
+        percent_encode_query(&upload_id)
+    );
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        LOCATION,
+        HeaderValue::from_str(&location)
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INVALID_UPLOAD_LOCATION"))?,
+    );
+    Ok((StatusCode::OK, response_headers, Json(EmptyResponse {})).into_response())
+}
+
+fn is_resumable_status_query(headers: &HeaderMap, body: &Bytes) -> bool {
+    body.is_empty()
+        && headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("bytes */"))
+            .unwrap_or(false)
 }
 
 fn upload_object(
@@ -495,9 +633,26 @@ fn metadata(bucket: &str, object: &ObjectRecord) -> ObjectMetadata {
         metageneration: "1".to_string(),
         size: object.data.len().to_string(),
         content_type: object.content_type.clone(),
+        crc32c: crc32c_base64(&object.data),
         time_created: object.created_at_ms.to_string(),
         updated: object.updated_at_ms.to_string(),
     }
+}
+
+fn crc32c_base64(data: &[u8]) -> String {
+    STANDARD.encode(crc32c(data).to_be_bytes())
+}
+
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0x82F6_3B78 & mask);
+        }
+    }
+    !crc
 }
 
 fn infer_project_id(bucket: &str) -> String {
@@ -506,6 +661,34 @@ fn infer_project_id(bucket: &str) -> String {
         .or_else(|| bucket.strip_suffix(".firebasestorage.app"))
         .unwrap_or(DEFAULT_PROJECT)
         .to_string()
+}
+
+fn request_base_url(headers: &HeaderMap) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost:9199");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    format!("{proto}://{host}")
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+fn percent_encode_query(value: &str) -> String {
+    percent_encode_path_segment(value)
 }
 
 fn now_ms() -> u64 {

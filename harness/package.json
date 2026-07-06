@@ -7,9 +7,10 @@
     "test:auth": "npm run test:auth-sdk && npm run test:auth-admin-sdk",
     "test:auth-sdk": "node src/test-auth-sdk.mjs",
     "test:auth-admin-sdk": "node src/test-auth-admin-sdk.mjs",
-    "test:storage-sdk": "node src/test-storage-sdk.mjs"
+    "test:storage-sdk": "node src/test-storage-sdk.mjs && node src/test-google-cloud-storage-sdk.mjs"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.21.0",
     "firebase": "^11.0.0",
     "firebase-admin": "^13.0.0",
     "firebase-tools": "^13.0.0"

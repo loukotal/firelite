@@ -137,6 +137,56 @@ async fn storage_firebase_v0_upload_and_project_scoped_reset() {
     assert_eq!(listed_after_reset["items"].as_array().unwrap().len(), 0);
 }
 
+#[tokio::test]
+async fn storage_gcs_resumable_upload_flow() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+    let bucket = "demo-firelite.appspot.com";
+
+    let started = client
+        .post(format!(
+            "{base_url}/upload/storage/v1/b/{bucket}/o?uploadType=resumable&name=reports/bank.csv"
+        ))
+        .header("x-upload-content-type", "text/csv")
+        .json(&serde_json::json!({
+            "name": "reports/bank.csv",
+            "contentType": "text/csv"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let location = started
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(location.starts_with(&base_url));
+    assert!(location.contains("uploadType=resumable"));
+
+    let uploaded: Value = client
+        .put(location)
+        .header("content-type", "text/csv")
+        .header("content-range", "bytes 0-15/16")
+        .body("date,amount\n1,2\n")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(uploaded["bucket"], bucket);
+    assert_eq!(uploaded["name"], "reports/bank.csv");
+    assert_eq!(uploaded["contentType"], "text/csv");
+    assert_eq!(uploaded["size"], "16");
+}
+
 async fn spawn_app() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -359,7 +359,7 @@ async fn auth_idp_sign_in_reuses_provider_identity() {
         format!("{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=fake");
     let payload = json!({
         "requestUri": "http://localhost",
-        "postBody": "providerId=google.com&rawId=google-123&email=alice%40example.test",
+        "postBody": "providerId=google.com&rawId=google-123&email=Alice%40Example.TEST",
         "returnSecureToken": true
     });
 
@@ -388,6 +388,48 @@ async fn auth_idp_sign_in_reuses_provider_identity() {
 
     assert_eq!(first["localId"], second["localId"]);
     assert_eq!(first["email"], "alice@example.test");
+}
+
+#[tokio::test]
+async fn auth_admin_create_normalizes_email_case() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "Mixed.Case@Example.TEST",
+            "password": "secret123"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(created["email"], "mixed.case@example.test");
+
+    let lookup: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:lookup?key=fake"
+        ))
+        .json(&json!({
+            "email": ["mixed.case@example.test"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lookup["users"][0]["email"], "mixed.case@example.test");
 }
 
 #[tokio::test]
@@ -504,8 +546,22 @@ async fn auth_admin_password_reset_link_creates_oob_link() {
     let oob_code = sent["oobCode"].as_str().unwrap();
     let oob_link = sent["oobLink"].as_str().unwrap();
     assert_eq!(sent["email"], email);
+    assert!(oob_link.starts_with(&base_url));
     assert!(oob_link.contains("mode=resetPassword"));
     assert!(oob_link.contains(&format!("oobCode={oob_code}")));
+
+    let action: Value = client
+        .get(oob_link)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(action["oobCode"], oob_code);
+    assert_eq!(action["email"], email);
 
     let listed: Value = client
         .get(format!(

@@ -1,13 +1,14 @@
 use crate::server::AppState;
 use axum::{
     extract::{Form, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -44,6 +45,7 @@ pub fn router() -> Router<SharedState> {
             "/emulator/v1/projects/:project_id/oobCodes",
             get(list_oob_codes),
         )
+        .route("/emulator/action", get(oob_action))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -154,6 +156,14 @@ struct EmailLinkRequest {
     email: String,
     oob_code: String,
     return_secure_token: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OobActionQuery {
+    mode: Option<String>,
+    oob_code: Option<String>,
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,8 +370,10 @@ async fn refresh_secure_token(
 async fn identity_action(
     State(state): State<SharedState>,
     Path(action): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> AuthResult<serde_json::Value> {
+    let auth_base_url = request_base_url(&headers);
     let body = match action.as_str() {
         "accounts:signUp" => {
             let payload = parse_payload(payload)?;
@@ -389,7 +401,12 @@ async fn identity_action(
         }
         "accounts:sendOobCode" => {
             let payload = parse_payload(payload)?;
-            serde_json::to_value(send_oob_code(&state, &default_project_id(), payload)?)
+            serde_json::to_value(send_oob_code(
+                &state,
+                &default_project_id(),
+                &auth_base_url,
+                payload,
+            )?)
         }
         "accounts:signInWithEmailLink" => {
             let payload = parse_payload(payload)?;
@@ -424,7 +441,12 @@ async fn identity_action(
                     }
                     "accounts:sendOobCode" => {
                         let payload = parse_payload(payload)?;
-                        serde_json::to_value(send_oob_code(&state, &project_id, payload)?)
+                        serde_json::to_value(send_oob_code(
+                            &state,
+                            &project_id,
+                            &auth_base_url,
+                            payload,
+                        )?)
                     }
                     _ => return Err(error(StatusCode::NOT_FOUND, "NOT_FOUND")),
                 }
@@ -451,11 +473,36 @@ async fn identity_get_action(
     Ok(Json(body))
 }
 
+async fn oob_action(
+    State(state): State<SharedState>,
+    Query(query): Query<OobActionQuery>,
+) -> AuthResult<serde_json::Value> {
+    let project_id = query.project_id.unwrap_or_else(default_project_id);
+    let oob_code = query
+        .oob_code
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_OOB_CODE"))?;
+    let projects = state.auth.projects.read().expect("auth state poisoned");
+    let record = projects
+        .get(&project_id)
+        .and_then(|project| project.oob_codes.get(&oob_code))
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_OOB_CODE"))?;
+    serde_json::to_value(json!({
+        "mode": query.mode.unwrap_or_else(|| "action".to_string()),
+        "oobCode": oob_code,
+        "projectId": project_id,
+        "email": record.email,
+        "requestType": record.request_type,
+    }))
+    .map(Json)
+    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"))
+}
+
 fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, AuthError> {
     let project_id = default_project_id();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.to_string()).or_default();
-    let email_key = normalize_email(&payload.email);
+    let email = normalize_email(&payload.email);
+    let email_key = email.clone();
 
     if project.user_ids_by_email.contains_key(&email_key) {
         return Err(error(StatusCode::BAD_REQUEST, "EMAIL_EXISTS"));
@@ -469,7 +516,7 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
     let local_id = Uuid::new_v4().to_string();
     let record = UserRecord {
         local_id: local_id.clone(),
-        email: payload.email,
+        email: email.clone(),
         display_name: None,
         photo_url: None,
         custom_attributes: None,
@@ -479,7 +526,7 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
         providers: vec![ProviderRecord {
             provider_id: "password".to_string(),
             raw_id: local_id,
-            email: email_key.clone(),
+            email,
         }],
         created_at_ms: now,
         last_login_at_ms: None,
@@ -512,7 +559,8 @@ fn admin_create_user(
     let email = payload
         .email
         .unwrap_or_else(|| format!("{local_id}@admin.local"));
-    let email_key = normalize_email(&email);
+    let email = normalize_email(&email);
+    let email_key = email.clone();
 
     if project.users_by_id.contains_key(&local_id) {
         return Err(error(StatusCode::BAD_REQUEST, "UID_EXISTS"));
@@ -779,6 +827,7 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
         .get("email")
         .cloned()
         .unwrap_or_else(|| format!("{}@{}.local", sanitize_email_part(&raw_id), provider_id));
+    let email = normalize_email(&email);
 
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.clone()).or_default();
@@ -812,7 +861,7 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
                 .insert((provider_id, raw_id), local_id.clone());
             project
                 .user_ids_by_email
-                .entry(normalize_email(&email))
+                .entry(email.clone())
                 .or_insert_with(|| local_id.clone());
             project.users_by_id.insert(local_id.clone(), record);
             project
@@ -833,6 +882,7 @@ fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResp
 fn send_oob_code(
     state: &SharedState,
     project_id: &str,
+    auth_base_url: &str,
     payload: SendOobCodeRequest,
 ) -> Result<OobCodeResponse, AuthError> {
     if payload.request_type != "EMAIL_SIGNIN" && payload.request_type != "PASSWORD_RESET" {
@@ -843,20 +893,17 @@ fn send_oob_code(
     }
 
     let _continue_url = payload.continue_url.as_deref().unwrap_or("");
+    let email = normalize_email(&payload.email);
     let code = format!("firelite-oob-{}", Uuid::new_v4());
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.to_string()).or_default();
-    if payload.request_type == "PASSWORD_RESET"
-        && !project
-            .user_ids_by_email
-            .contains_key(&normalize_email(&payload.email))
-    {
+    if payload.request_type == "PASSWORD_RESET" && !project.user_ids_by_email.contains_key(&email) {
         return Err(error(StatusCode::BAD_REQUEST, "EMAIL_NOT_FOUND"));
     }
     project.oob_codes.insert(
         code.clone(),
         OobCodeRecord {
-            email: payload.email.clone(),
+            email: email.clone(),
             request_type: payload.request_type.clone(),
             created_at_ms: now_ms(),
         },
@@ -864,10 +911,10 @@ fn send_oob_code(
     let oob_link = payload
         .return_oob_link
         .unwrap_or(false)
-        .then(|| make_oob_link(project_id, &payload.request_type, &code));
+        .then(|| make_oob_link(auth_base_url, project_id, &payload.request_type, &code));
 
     Ok(OobCodeResponse {
-        email: payload.email,
+        email,
         oob_code: code,
         oob_link,
     })
@@ -897,9 +944,9 @@ fn sign_in_with_email_link(
     let record = get_or_create_user(
         project,
         &local_id,
-        &payload.email,
+        &normalize_email(&payload.email),
         "emailLink",
-        &payload.email,
+        &normalize_email(&payload.email),
     );
     record.last_login_at_ms = Some(now_ms());
 
@@ -1003,13 +1050,14 @@ fn get_or_create_user<'a>(
     provider_id: &str,
     raw_id: &str,
 ) -> &'a mut UserRecord {
+    let email = normalize_email(email);
     if project.users_by_id.contains_key(local_id) {
         return project.users_by_id.get_mut(local_id).expect("user exists");
     }
 
     let record = UserRecord {
         local_id: local_id.to_string(),
-        email: email.to_string(),
+        email: email.clone(),
         display_name: None,
         photo_url: None,
         custom_attributes: None,
@@ -1019,14 +1067,14 @@ fn get_or_create_user<'a>(
         providers: vec![ProviderRecord {
             provider_id: provider_id.to_string(),
             raw_id: raw_id.to_string(),
-            email: email.to_string(),
+            email: email.clone(),
         }],
         created_at_ms: now_ms(),
         last_login_at_ms: None,
     };
     project
         .user_ids_by_email
-        .entry(normalize_email(email))
+        .entry(email)
         .or_insert_with(|| local_id.to_string());
     project.user_ids_by_provider.insert(
         (provider_id.to_string(), raw_id.to_string()),
@@ -1048,17 +1096,34 @@ fn parse_project_action(action: &str) -> Option<(String, &str)> {
     Some((project_id.to_string(), admin_action))
 }
 
-fn make_oob_link(project_id: &str, request_type: &str, oob_code: &str) -> String {
+fn make_oob_link(
+    auth_base_url: &str,
+    project_id: &str,
+    request_type: &str,
+    oob_code: &str,
+) -> String {
     let mode = match request_type {
         "PASSWORD_RESET" => "resetPassword",
         "EMAIL_SIGNIN" => "signIn",
         _ => "action",
     };
     format!(
-        "http://localhost:9099/emulator/action?mode={mode}&oobCode={}&projectId={}",
+        "{auth_base_url}/emulator/action?mode={mode}&oobCode={}&projectId={}",
         percent_encode_query(oob_code),
         percent_encode_query(project_id)
     )
+}
+
+fn request_base_url(headers: &HeaderMap) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost:9099");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    format!("{proto}://{host}")
 }
 
 fn percent_encode_query(value: &str) -> String {

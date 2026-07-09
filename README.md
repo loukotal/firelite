@@ -48,18 +48,20 @@ curl -s 'http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signUp
 
 ```sh
 firelite daemon
-firelite attach --project demo-myrepo-agent-17 --workdir ./checkout-17
-firelite attachments
 firelite reset --project demo-myrepo-agent-17
 firelite functions --project demo-myrepo-agent-17 --watch ./functions --port 5001
-firelite functions --project demo-myrepo-agent-17 --watch ./functions --build-command 'npm run build'
 firelite emulators --project demo-myrepo-agent-17 --watch ./functions
 firelite emulators --project demo-myrepo-agent-17 --watch ./functions --filter api
+firelite emulators --project demo-myrepo-agent-17 --watch ./functions --no-reload
 ```
 
-`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. For TypeScript functions, pass the same SWC/tsc build command the Firebase emulator expects; Firelite runs it before the initial load and before each reload. `attach` registers a running checkout-local functions worker with the daemon control plane; `attachments` lists registered workers. `reset` is still present to lock the UX surface and will be wired to the daemon control plane in later milestones.
+`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. TypeScript functions should be built by the surrounding test/dev workflow before Firelite loads the functions directory. `reset` is still present to lock the UX surface and will be wired to per-project state reset in later milestones.
 
 `emulators` runs Auth, Storage, Pub/Sub, Cloud Tasks, and Functions together. By default it listens on the local setup ports: Auth on `127.0.0.1:9099`, Storage on `127.0.0.1:9199`, Pub/Sub on `127.0.0.1:8085`, Cloud Tasks on `127.0.0.1:9899`, and Functions on `127.0.0.1:5001`. The listeners share the same in-memory state.
+
+For CI runs where function source does not change after startup, pass `--no-reload` to skip the file polling task. The combined runner loads and validates the initial Functions worker before opening the other emulator listeners. The Functions listener reports worker liveness at `/__/health`.
+
+Terminal logs are intentionally compact: Firelite keeps timestamps but omits repeated level labels and per-line worker metadata. Known request-context dumps are reduced to path/type/status/duration summaries, while application stack traces retain their original shape. Interactive terminals color HTTP methods and response status fields; redirected CI logs remain free of ANSI escapes. Set `RUST_LOG=debug` or `RUST_LOG=firelite=debug` when deeper diagnostics are needed.
 
 Example:
 
@@ -81,35 +83,7 @@ Pass `--filter` to run only selected Cloud Functions exports/names. It can be re
 
 Pub/Sub accepts HTTP/JSON emulator calls at `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` for topic/subscription create, publish, pull, and acknowledge flows.
 
-Cloud Tasks accepts Firebase Admin SDK task queue `createTask` calls at `CLOUD_TASKS_EMULATOR_HOST=127.0.0.1:9899`. Enqueued task queue requests are dispatched to the attached functions worker whose filter matches the queue/function name. In the basic implementation, dispatch is synchronous and runs before the create-task response returns.
-
-To attach separately started functions workers to a daemon:
-
-```sh
-# terminal 1
-firelite daemon --host 127.0.0.1 --port 9099
-
-# terminal 2: starts a functions worker and registers it with the daemon
-firelite functions \
-  --project demo-myrepo-agent-17 \
-  --watch ./functions \
-  --port 5001 \
-  --filter api \
-  --attach
-
-# terminal 3: optional second worker on another port
-firelite functions \
-  --project demo-myrepo-agent-17 \
-  --watch ./functions \
-  --port 5002 \
-  --filter e2e \
-  --attach
-
-firelite attachments
-
-# The daemon can now proxy attached function routes:
-curl http://127.0.0.1:9099/demo-myrepo-agent-17/us-central1/api
-```
+Cloud Tasks accepts Firebase Admin SDK task queue `createTask` calls at `CLOUD_TASKS_EMULATOR_HOST=127.0.0.1:9899`. In `firelite emulators`, enqueued task queue requests are dispatched directly to the checkout-local functions worker when the filter matches the queue/function name. In the basic implementation, dispatch is synchronous and runs before the create-task response returns. Dispatch targets are intentionally limited to local `http://` URLs so the runtime does not carry a TLS stack.
 
 To run Firelite from another checkout, execute Cargo from the project or
 functions directory and point `--manifest-path` at this repository:

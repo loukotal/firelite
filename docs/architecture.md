@@ -12,11 +12,13 @@ Firelite separates checkout-specific process work from shared stateful emulator 
 
 ## Modules
 
-- `firelite daemon`: shared backend process and future control plane.
-- `firelite attach`: planned registration of `{ project_id, workdir, ports, env }`.
+- `firelite daemon`: shared backend process for stateful emulator-compatible services.
 - `firelite reset`: planned per-project state reset across all enabled services.
 - `firelite functions`: checkout-local function worker supervisor. It starts a Node worker, discovers Firebase Functions exports from the watched source directory, proxies emulator-compatible HTTP function URLs, and restarts the worker when source files change.
+- `firelite emulators`: combined local runner for stateful services plus one checkout-local functions worker. Cloud Tasks dispatch is wired directly to that local worker. Stateful listeners open only after the initial Functions worker is ready.
 - `auth`, `storage`, `pubsub`, and `tasks`: in-memory, project-scoped emulator state.
+
+The Functions supervisor monitors both source changes and the Node child process. Unexpected worker exits temporarily mark Functions unhealthy and trigger bounded-backoff restarts. CI runs that do not edit function source can use `--no-reload` to avoid polling the checkout.
 
 ## Compatibility strategy
 
@@ -35,4 +37,4 @@ The first Auth implementation is in-memory for fast tests. The durable daemon st
 
 ## Tracing
 
-The daemon uses structured tracing. Request IDs and event IDs should be propagated through SDK-facing HTTP/gRPC handlers, internal queues, and Functions delivery paths as those services are implemented.
+Firelite uses tracing internally but renders compact terminal output with timestamps and without repeated level labels. Functions worker output is forwarded without per-line generation/source prefixes; known request-context dumps are collapsed to path/type/status/duration summaries. Request IDs and event IDs should be propagated through SDK-facing HTTP/gRPC handlers, internal queues, and Functions delivery paths as those services are implemented, but stay out of the default human-facing output.

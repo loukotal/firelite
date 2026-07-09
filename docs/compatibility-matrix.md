@@ -21,15 +21,15 @@ Status legend:
 | Auth | Admin SDK `createUser`, `getUser`, `getUserByEmail`, `listUsers`, `deleteUser` | implemented | Covered by Firebase Admin SDK E2E harness. |
 | Auth | import/export | planned | Needed for parity with Emulator Suite workflows. |
 | Auth | MFA and deeper provider/OOB parity | planned | Tracked in `docs/auth-emulator-api-surface.md`; add only when real local tests require them. |
-| Cloud Tasks | REST create/list/delete task flows | implemented | Supports Firebase Admin SDK emulator REST create calls, in-memory list/get/delete, and base64 HTTP body decoding. Lease/pause/purge behavior remains planned. |
-| Cloud Tasks | Functions task queue dispatch | implemented | Dispatches task queue requests to the attached functions worker matching the queue/function name. Basic version is synchronous and single-attempt. |
+| Cloud Tasks | REST create/list/delete task flows | implemented | Supports Firebase Admin SDK emulator REST create calls, in-memory list/get/delete, base64 HTTP body decoding, and bounded local HTTP dispatch. HTTPS targets and lease/pause/purge behavior remain unsupported. |
+| Cloud Tasks | Functions task queue dispatch | implemented | In `firelite emulators`, dispatches task queue requests directly to the local functions worker matching the queue/function name. Basic version is synchronous and single-attempt. |
 | Pub/Sub | topic/subscription CRUD and publish/pull/acknowledge | implemented | HTTP/JSON emulator subset, in-memory and project-scoped. Full SDK gRPC behavior still needs discovery. |
 | Pub/Sub | push delivery to Functions emulator | unknown | Needs event flow capture. |
 | Storage | JSON API media upload/download/list/delete | implemented | In-memory object state with `/upload/storage/v1`, `/storage/v1`, and Firebase `/v0` object paths. Defer XML API, resumable uploads, and full Firebase Security Rules fidelity. |
 | Storage | Emulator bucket object inspection/reset | implemented | `/emulator/v1/projects/{project}/storage/buckets/{bucket}/objects` supports list/reset for local tests. |
 | Storage | Functions object events | unknown | Needs event flow capture. |
 | Functions | HTTP/callable export discovery and proxying | implemented | `firelite functions` starts a checkout-local Node worker, reads gen1/gen2 metadata, and serves `/{project}/{region}/{function}` URLs. |
-| Functions | File-watch reload | implemented | Polls watched source files, restarts the Node worker, and swaps the active registry after successful rediscovery. |
+| Functions | File-watch reload | implemented | Polls watched source files off the async runtime, restarts the Node worker, and swaps the active registry after successful rediscovery. Use `--no-reload` for immutable CI checkouts. |
 | Functions | Background event dispatch | planned | Auth/Pub/Sub/Storage triggers can be registered by discovery but are not dispatched yet. Cloud Tasks task queue functions are dispatched through HTTP-compatible task queue triggers. |
 | Functions | Native Rust worker orchestration | planned | Long-term fast reload path if Node process startup becomes the bottleneck. |
 | Emulator Hub | locator metadata endpoints | unknown | Discovery harness should capture hub endpoints expected by SDKs/tools. |

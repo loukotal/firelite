@@ -1,4 +1,4 @@
-use crate::{auth, config::DaemonConfig, control, pubsub, storage, tasks, web_ui};
+use crate::{auth, config::DaemonConfig, pubsub, storage, tasks, web_ui};
 use anyhow::Context;
 use axum::{
     extract::Request,
@@ -13,7 +13,7 @@ use axum::{
     routing::get,
     Router,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::{sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -23,7 +23,6 @@ pub struct AppState {
     pub storage: storage::StorageState,
     pub pubsub: pubsub::PubsubState,
     pub tasks: tasks::TasksState,
-    pub attachments: Arc<std::sync::RwLock<BTreeMap<String, control::FunctionAttachment>>>,
     pub http_client: reqwest::Client,
 }
 
@@ -33,8 +32,10 @@ pub fn app_state() -> Arc<AppState> {
         storage: storage::StorageState::default(),
         pubsub: pubsub::PubsubState::default(),
         tasks: tasks::TasksState::default(),
-        attachments: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .expect("valid HTTP client configuration"),
     })
 }
 
@@ -47,7 +48,6 @@ pub fn app_with_state(state: Arc<AppState>) -> Router {
         .route("/", get(root))
         .route("/__/health", get(health))
         .route("/__/ui", get(web_ui::console))
-        .merge(control::router())
         .merge(auth::router())
         .merge(storage::router())
         .merge(pubsub::router())

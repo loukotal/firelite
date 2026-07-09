@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use firelite::server;
+use firelite::{server, tasks::FunctionsTarget};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -72,103 +72,8 @@ async fn storage_management_create_list_delete_flow() {
 }
 
 #[tokio::test]
-async fn attaches_multiple_functions_workers() {
-    let base_url = spawn_app().await;
-    let client = reqwest::Client::new();
-
-    for (port, filters) in [(5001, vec!["api"]), (5002, vec!["e2e"])] {
-        client
-            .post(format!("{base_url}/__/control/attachments"))
-            .json(&serde_json::json!({
-                "projectId": "demo-firelite",
-                "workdir": format!("/tmp/checkout-{port}"),
-                "functionsHost": "127.0.0.1",
-                "functionsPort": port,
-                "filters": filters
-            }))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
-    }
-
-    let listed: Value = client
-        .get(format!("{base_url}/__/control/attachments"))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let attachments = listed["attachments"].as_array().unwrap();
-    assert_eq!(attachments.len(), 2);
-    assert!(attachments
-        .iter()
-        .any(|attachment| attachment["id"] == "demo-firelite@127.0.0.1:5001"));
-    assert!(attachments
-        .iter()
-        .any(|attachment| attachment["id"] == "demo-firelite@127.0.0.1:5002"));
-}
-
-#[tokio::test]
-async fn proxies_function_routes_to_attached_worker() {
-    let base_url = spawn_app().await;
-    let worker_url = spawn_mock_functions_worker().await;
-    let worker_port = worker_url
-        .rsplit(':')
-        .next()
-        .unwrap()
-        .parse::<u16>()
-        .unwrap();
-    let client = reqwest::Client::new();
-
-    client
-        .post(format!("{base_url}/__/control/attachments"))
-        .json(&serde_json::json!({
-            "projectId": "demo-firelite",
-            "workdir": "/tmp/checkout",
-            "functionsHost": "127.0.0.1",
-            "functionsPort": worker_port,
-            "filters": ["api"]
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    let proxied: Value = client
-        .post(format!(
-            "{base_url}/demo-firelite/us-central1/api/users/1?debug=true"
-        ))
-        .header("x-firelite-test", "attached-worker")
-        .body("hello")
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    assert_eq!(
-        proxied["path"],
-        "/demo-firelite/us-central1/api/users/1?debug=true"
-    );
-    assert_eq!(proxied["method"], "POST");
-    assert_eq!(proxied["header"], "attached-worker");
-    assert_eq!(proxied["body"], "hello");
-}
-
-#[tokio::test]
-async fn cloud_tasks_create_dispatches_to_attached_function_queue() {
+async fn cloud_tasks_create_dispatches_to_configured_function_queue() {
     let state = server::app_state();
-    let base_url = spawn_app_with_state(state).await;
     let captured = Arc::new(Mutex::new(Vec::new()));
     let worker_url = spawn_capturing_functions_worker(captured.clone()).await;
     let worker_port = worker_url
@@ -177,22 +82,14 @@ async fn cloud_tasks_create_dispatches_to_attached_function_queue() {
         .unwrap()
         .parse::<u16>()
         .unwrap();
+    state.tasks.set_functions_target(FunctionsTarget {
+        project_id: "demo-firelite".to_string(),
+        functions_host: "127.0.0.1".to_string(),
+        functions_port: worker_port,
+        filters: vec!["jobs.run".to_string()],
+    });
+    let base_url = spawn_app_with_state(state).await;
     let client = reqwest::Client::new();
-
-    client
-        .post(format!("{base_url}/__/control/attachments"))
-        .json(&serde_json::json!({
-            "projectId": "demo-firelite",
-            "workdir": "/tmp/checkout",
-            "functionsHost": "127.0.0.1",
-            "functionsPort": worker_port,
-            "filters": ["jobs.run"]
-        }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
 
     let body = BASE64.encode(r#"{"data":{"jobTaskId":"task-1"}}"#);
     let created: Value = client
@@ -250,42 +147,6 @@ async fn spawn_app_with_state(state: Arc<server::AppState>) -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, server::app_with_state(state))
-            .await
-            .unwrap();
-    });
-    format!("http://{addr}")
-}
-
-async fn spawn_mock_functions_worker() -> String {
-    use axum::{
-        body::Bytes,
-        extract::OriginalUri,
-        http::{HeaderMap, Method},
-        response::Json,
-        routing::any,
-        Router,
-    };
-
-    async fn handler(
-        OriginalUri(uri): OriginalUri,
-        method: Method,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> Json<Value> {
-        Json(serde_json::json!({
-            "method": method.as_str(),
-            "path": uri.to_string(),
-            "header": headers
-                .get("x-firelite-test")
-                .and_then(|value| value.to_str().ok()),
-            "body": String::from_utf8_lossy(&body),
-        }))
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, Router::new().route("/*path", any(handler)))
             .await
             .unwrap();
     });

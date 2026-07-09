@@ -4,24 +4,25 @@ use axum::{
     extract::{OriginalUri, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::{any, get},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    io::IsTerminal,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::SystemTime,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
     net::TcpListener,
     process::{Child, Command},
     sync::{mpsc, RwLock},
-    time::{sleep, Duration},
+    time::{sleep, timeout, Duration},
 };
 use tracing::{error, event, info, warn, Level};
 
@@ -30,8 +31,15 @@ pub struct FunctionsConfig {
     pub project_id: String,
     pub source_dir: PathBuf,
     pub addr: SocketAddr,
-    pub build_command: Option<String>,
     pub filters: Vec<String>,
+    pub reload_on_change: bool,
+}
+
+pub struct PreparedFunctions {
+    config: FunctionsConfig,
+    listener: TcpListener,
+    state: Arc<FunctionsState>,
+    started: StartedWorker,
 }
 
 #[derive(Debug, Clone)]
@@ -102,48 +110,109 @@ struct StartedWorker {
 }
 
 pub async fn serve(config: FunctionsConfig) -> anyhow::Result<()> {
+    prepare(config).await?.serve().await
+}
+
+pub async fn prepare(config: FunctionsConfig) -> anyhow::Result<PreparedFunctions> {
+    let started = start_worker(&config.project_id, &config.source_dir, &config.filters, 1)
+        .await
+        .context("failed to load initial functions worker")?;
+    log_loaded_worker(&started.active);
+
     let listener = TcpListener::bind(config.addr)
         .await
         .with_context(|| format!("failed to bind functions emulator {}", config.addr))?;
-    let bound_addr = listener.local_addr().context("missing listener addr")?;
     let state = Arc::new(FunctionsState {
         project_id: config.project_id.clone(),
-        active: Arc::new(RwLock::new(None)),
-        client: reqwest::Client::new(),
+        active: Arc::new(RwLock::new(Some(started.active.clone()))),
+        client: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .context("failed to configure functions HTTP client")?,
     });
-    let (reload_tx, reload_rx) = mpsc::channel(8);
 
-    tokio::spawn(supervise_workers(
-        config.project_id.clone(),
-        config.source_dir.clone(),
-        config.build_command.clone(),
-        config.filters.clone(),
-        state.active.clone(),
-        reload_rx,
-    ));
-    tokio::spawn(watch_source(config.source_dir.clone(), reload_tx.clone()));
-    reload_tx
-        .send(())
-        .await
-        .context("failed to queue initial functions load")?;
+    Ok(PreparedFunctions {
+        config,
+        listener,
+        state,
+        started,
+    })
+}
 
-    info!(
-        addr = %bound_addr,
-        project = %config.project_id,
-        source = %config.source_dir.display(),
-        "firelite functions emulator listening"
-    );
+impl PreparedFunctions {
+    pub async fn serve(self) -> anyhow::Result<()> {
+        let Self {
+            config,
+            listener,
+            state,
+            started,
+        } = self;
+        let bound_addr = listener.local_addr().context("missing listener addr")?;
+        let (reload_tx, reload_rx) = mpsc::channel(8);
 
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("functions emulator stopped unexpectedly")
+        let supervisor = tokio::spawn(supervise_workers(
+            config.project_id.clone(),
+            config.source_dir.clone(),
+            config.filters.clone(),
+            state.active.clone(),
+            reload_rx,
+            started.child,
+            1,
+        ));
+        let (watcher, reload_guard) = if config.reload_on_change {
+            (
+                Some(tokio::spawn(watch_source(
+                    config.source_dir.clone(),
+                    reload_tx,
+                ))),
+                None,
+            )
+        } else {
+            (None, Some(reload_tx))
+        };
+
+        info!(
+            addr = %bound_addr,
+            project = %config.project_id,
+            source = %config.source_dir.display(),
+            reload_on_change = config.reload_on_change,
+            "firelite functions emulator listening"
+        );
+
+        let result = axum::serve(listener, app(state))
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("functions emulator stopped unexpectedly");
+
+        drop(reload_guard);
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
+        supervisor.abort();
+        let _ = supervisor.await;
+
+        result
+    }
 }
 
 fn app(state: Arc<FunctionsState>) -> Router {
     Router::new()
+        .route("/__/health", get(functions_health))
         .route("/*path", any(proxy_request))
         .with_state(state)
+}
+
+async fn functions_health(State(state): State<Arc<FunctionsState>>) -> Response {
+    if state.active.read().await.is_some() {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "functions worker unavailable",
+        )
+            .into_response()
+    }
 }
 
 async fn proxy_request(
@@ -209,10 +278,7 @@ async fn proxy_request_inner(
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid method").into_response())?;
-    let mut request = state
-        .client
-        .request(reqwest_method, target)
-        .body(body.to_vec());
+    let mut request = state.client.request(reqwest_method, target).body(body);
     for (name, value) in headers.iter() {
         if name.as_str().eq_ignore_ascii_case("host")
             || name.as_str().eq_ignore_ascii_case("content-length")
@@ -301,95 +367,78 @@ pub(crate) fn parse_function_route(path: &str) -> Option<ParsedRoute> {
 async fn supervise_workers(
     project_id: String,
     source_dir: PathBuf,
-    build_command: Option<String>,
     filters: Vec<String>,
     active: Arc<RwLock<Option<ActiveWorker>>>,
     mut reload_rx: mpsc::Receiver<()>,
+    mut current: Child,
+    mut generation: u64,
 ) {
-    let mut generation = 0;
-    let mut current: Option<Child> = None;
+    let mut worker_running = true;
+    let mut reload_channel_open = true;
+    let mut restart_delay = Duration::from_millis(250);
 
-    while reload_rx.recv().await.is_some() {
-        while reload_rx.try_recv().is_ok() {}
-        generation += 1;
+    loop {
+        let reload_requested = if worker_running {
+            tokio::select! {
+                reload = reload_rx.recv(), if reload_channel_open => {
+                    if reload.is_none() {
+                        reload_channel_open = false;
+                        continue;
+                    }
+                    true
+                }
+                status = current.wait() => {
+                    match status {
+                        Ok(status) => warn!(%status, generation, "functions worker exited"),
+                        Err(error) => error!(%error, generation, "failed to wait for functions worker"),
+                    }
+                    *active.write().await = None;
+                    worker_running = false;
+                    false
+                }
+            }
+        } else {
+            tokio::select! {
+                reload = reload_rx.recv(), if reload_channel_open => {
+                    if reload.is_none() {
+                        reload_channel_open = false;
+                        continue;
+                    }
+                    true
+                }
+                _ = sleep(restart_delay) => false,
+            }
+        };
 
-        if let Err(error) =
-            run_build_command(build_command.as_deref(), &source_dir, generation).await
-        {
-            error!(%error, generation, "failed to build functions source");
-            continue;
+        if reload_requested {
+            while reload_rx.try_recv().is_ok() {}
         }
+        generation += 1;
 
         match start_worker(&project_id, &source_dir, &filters, generation).await {
             Ok(started) => {
-                let names = started
-                    .active
-                    .http_functions
-                    .keys()
-                    .map(|key| format!("{}/{}", key.region, key.name))
-                    .collect::<Vec<_>>();
-                info!(
-                    generation,
-                    registered_functions = started.active.functions.len(),
-                    functions = ?names,
-                    "loaded functions worker"
-                );
-                let old = current.replace(started.child);
+                log_loaded_worker(&started.active);
+                let old = std::mem::replace(&mut current, started.child);
                 *active.write().await = Some(started.active);
-                if let Some(mut child) = old {
+                if worker_running {
+                    let mut child = old;
                     if let Err(error) = child.kill().await {
                         warn!(%error, "failed to stop previous functions worker");
                     }
                 }
+                worker_running = true;
+                restart_delay = Duration::from_millis(250);
             }
             Err(error) => {
-                error!(%error, generation, "failed to load functions worker");
+                if worker_running {
+                    error!(%error, generation, "failed to reload functions worker; keeping previous worker");
+                } else {
+                    error!(%error, generation, "failed to restart functions worker; retrying");
+                    restart_delay = restart_delay.saturating_mul(2).min(Duration::from_secs(5));
+                }
             }
         }
     }
-}
-
-async fn run_build_command(
-    build_command: Option<&str>,
-    source_dir: &Path,
-    generation: u64,
-) -> anyhow::Result<()> {
-    let Some(build_command) = build_command else {
-        return Ok(());
-    };
-
-    info!(generation, command = %build_command, "building functions source");
-    let output = Command::new("sh")
-        .arg("-lc")
-        .arg(build_command)
-        .current_dir(source_dir)
-        .output()
-        .await
-        .with_context(|| format!("failed to run build command `{build_command}`"))?;
-
-    if !output.stdout.is_empty() {
-        info!(
-            generation,
-            output = %String::from_utf8_lossy(&output.stdout),
-            "functions build stdout"
-        );
-    }
-    if !output.stderr.is_empty() {
-        warn!(
-            generation,
-            output = %String::from_utf8_lossy(&output.stderr),
-            "functions build stderr"
-        );
-    }
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "build command `{build_command}` exited with {}",
-            output.status
-        ));
-    }
-
-    Ok(())
 }
 
 async fn start_worker(
@@ -414,16 +463,16 @@ async fn start_worker(
         .take()
         .ok_or_else(|| anyhow!("missing worker stdout"))?;
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(log_worker_stderr(stderr, generation));
+        tokio::spawn(log_worker_stderr(stderr));
     }
 
     let mut lines = BufReader::new(stdout).lines();
-    let line = lines
-        .next_line()
+    let line = timeout(Duration::from_secs(15), lines.next_line())
         .await
+        .context("timed out waiting for worker ready message")?
         .context("failed to read worker ready message")?
         .ok_or_else(|| anyhow!("worker exited before ready message"))?;
-    tokio::spawn(log_worker_stdout(lines, generation));
+    tokio::spawn(log_worker_stdout(lines));
 
     let message: WorkerMessage =
         serde_json::from_str(&line).with_context(|| format!("invalid worker message: {line}"))?;
@@ -456,6 +505,20 @@ async fn start_worker(
             http_functions,
         },
     })
+}
+
+fn log_loaded_worker(active: &ActiveWorker) {
+    let names = active
+        .http_functions
+        .keys()
+        .map(|key| format!("{}/{}", key.region, key.name))
+        .collect::<Vec<_>>();
+    info!(
+        generation = active.generation,
+        registered_functions = active.functions.len(),
+        functions = ?names,
+        "loaded functions worker"
+    );
 }
 
 const FUNCTIONS_WORKER: &[u8] = include_bytes!("functions_worker.cjs");
@@ -527,42 +590,322 @@ pub(crate) fn function_id_matches_filter(value: &str, filter: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('/'))
 }
 
-async fn log_worker_stdout(
-    mut lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    generation: u64,
-) {
-    while let Ok(Some(line)) = lines.next_line().await {
-        log_worker_line("stdout", generation, &line, Level::INFO);
+async fn log_worker_stdout(lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>) {
+    log_worker_stream(lines, Level::INFO).await;
+}
+
+async fn log_worker_stderr(stderr: tokio::process::ChildStderr) {
+    log_worker_stream(BufReader::new(stderr).lines(), Level::WARN).await;
+}
+
+async fn log_worker_stream<R>(mut lines: tokio::io::Lines<R>, fallback_level: Level)
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut pending = None::<String>;
+
+    loop {
+        if pending.is_none() {
+            let Ok(Some(line)) = lines.next_line().await else {
+                break;
+            };
+            pending = Some(line);
+            continue;
+        }
+
+        tokio::select! {
+            result = lines.next_line() => {
+                match result {
+                    Ok(Some(line)) if is_worker_record_continuation(&line) => {
+                        let record = pending.as_mut().expect("pending worker record");
+                        record.push('\n');
+                        record.push_str(&line);
+                    }
+                    Ok(Some(line)) => {
+                        flush_worker_record(&mut pending, fallback_level);
+                        pending = Some(line);
+                    }
+                    _ => {
+                        flush_worker_record(&mut pending, fallback_level);
+                        break;
+                    }
+                }
+            }
+            _ = sleep(Duration::from_millis(20)) => {
+                flush_worker_record(&mut pending, fallback_level);
+            }
+        }
     }
 }
 
-async fn log_worker_stderr(stderr: tokio::process::ChildStderr, generation: u64) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        log_worker_line("stderr", generation, &line, Level::WARN);
+fn is_worker_record_continuation(line: &str) -> bool {
+    line.chars().next().is_none_or(char::is_whitespace)
+}
+
+fn flush_worker_record(pending: &mut Option<String>, fallback_level: Level) {
+    if let Some(record) = pending.take() {
+        let record = expand_escaped_whitespace(record);
+        log_worker_line(&compact_worker_record(&record), fallback_level);
     }
 }
 
-fn log_worker_line(source: &'static str, generation: u64, line: &str, fallback_level: Level) {
+fn compact_worker_record(record: &str) -> String {
+    let heading = record.lines().next().unwrap_or_default().trim();
+    let fields = record
+        .lines()
+        .skip(1)
+        .filter_map(parse_worker_record_field)
+        .collect::<Vec<_>>();
+    if !fields
+        .iter()
+        .any(|(key, _)| is_request_context_metadata(key))
+    {
+        return record.to_string();
+    }
+
+    let details = fields
+        .into_iter()
+        .filter(|(key, _)| !is_request_context_metadata(key))
+        .filter_map(|(key, value)| format_request_context_field(&key, &value))
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        heading.to_string()
+    } else {
+        format!("{heading} {}", details.join(" "))
+    }
+}
+
+fn parse_worker_record_field(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.trim().trim_end_matches(',').split_once(':')?;
+    let key = key.trim().trim_matches('"');
+    let value = value.trim().trim_end_matches(',').trim_matches('"');
+    (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
+}
+
+fn is_request_context_metadata(key: &str) -> bool {
+    matches!(key, "executionId" | "sessionId" | "userId")
+}
+
+fn format_request_context_field(key: &str, value: &str) -> Option<String> {
+    if value == "{" || value == "}" {
+        return None;
+    }
+
+    Some(match key {
+        "durationMillis" => format!("duration={value}ms"),
+        "statusCode" => format!("status={value}"),
+        _ => format!("{key}={value}"),
+    })
+}
+
+fn log_worker_line(line: &str, fallback_level: Level) {
     let formatted = format_worker_log_line(line, fallback_level);
-    let message = format!(
-        "[functions worker:{source} generation={generation}] {}",
-        formatted.message
+    let message = decorate_worker_message(
+        &formatted.message,
+        formatted.level,
+        formatted.structured,
+        colors_enabled(),
     );
 
     match formatted.level {
-        Level::ERROR => event!(Level::ERROR, "{}", message),
-        Level::WARN => event!(Level::WARN, "{}", message),
-        Level::INFO => event!(Level::INFO, "{}", message),
-        Level::DEBUG => event!(Level::DEBUG, "{}", message),
-        Level::TRACE => event!(Level::TRACE, "{}", message),
+        Level::ERROR => {
+            event!(target: "firelite_worker", Level::ERROR, worker_message = message.as_str())
+        }
+        Level::WARN => {
+            event!(target: "firelite_worker", Level::WARN, worker_message = message.as_str())
+        }
+        Level::INFO => {
+            event!(target: "firelite_worker", Level::INFO, worker_message = message.as_str())
+        }
+        Level::DEBUG => {
+            event!(target: "firelite_worker", Level::DEBUG, worker_message = message.as_str())
+        }
+        Level::TRACE => {
+            event!(target: "firelite_worker", Level::TRACE, worker_message = message.as_str())
+        }
     }
+}
+
+fn colors_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let forced = std::env::var("FORCE_COLOR")
+            .ok()
+            .is_some_and(|value| value != "0");
+        forced
+            || (std::env::var_os("NO_COLOR").is_none()
+                && std::env::var("TERM").ok().as_deref() != Some("dumb")
+                && (std::io::stderr().is_terminal() || std::env::var_os("HERDR_ENV").is_some()))
+    })
+}
+
+fn decorate_worker_message(message: &str, level: Level, structured: bool, enabled: bool) -> String {
+    if !enabled {
+        return message.to_string();
+    }
+
+    if structured {
+        return colorize_structured_log(message, level);
+    }
+
+    let mut decorated = colorize_http_method(message);
+    colorize_status_field(&mut decorated);
+    decorated
+}
+
+fn colorize_structured_log(message: &str, level: Level) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(message) {
+        let mut output = String::new();
+        write_colored_json(&value, 0, &mut output);
+        return output;
+    }
+
+    let Some((summary, fields)) = message.split_once(" | ") else {
+        return colorize_log_summary(message, level);
+    };
+    let summary = colorize_log_summary(summary, level);
+    let fields = fields
+        .split(' ')
+        .map(|field| {
+            let Some((key, value)) = field.split_once('=') else {
+                return field.to_string();
+            };
+            format!("\u{1b}[36m{key}\u{1b}[0m=\u{1b}[32m{value}\u{1b}[0m")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{summary} \u{1b}[2m|\u{1b}[0m {fields}")
+}
+
+fn colorize_log_summary(message: &str, level: Level) -> String {
+    let color = match level {
+        Level::ERROR => "1;31",
+        Level::WARN => "1;33",
+        Level::DEBUG | Level::TRACE => "2",
+        Level::INFO => return message.to_string(),
+    };
+    format!("\u{1b}[{color}m{message}\u{1b}[0m")
+}
+
+fn write_colored_json(value: &serde_json::Value, indent: usize, output: &mut String) {
+    const RESET: &str = "\u{1b}[0m";
+    const PUNCTUATION: &str = "\u{1b}[2m";
+    match value {
+        serde_json::Value::Object(object) => {
+            output.push_str(PUNCTUATION);
+            output.push('{');
+            output.push_str(RESET);
+            if !object.is_empty() {
+                output.push('\n');
+            }
+            for (index, (key, value)) in object.iter().enumerate() {
+                output.push_str(&" ".repeat(indent + 2));
+                output.push_str("\u{1b}[36m");
+                output
+                    .push_str(&serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\"")));
+                output.push_str(RESET);
+                output.push_str(PUNCTUATION);
+                output.push_str(": ");
+                output.push_str(RESET);
+                write_colored_json(value, indent + 2, output);
+                if index + 1 != object.len() {
+                    output.push_str(PUNCTUATION);
+                    output.push(',');
+                    output.push_str(RESET);
+                }
+                output.push('\n');
+            }
+            if !object.is_empty() {
+                output.push_str(&" ".repeat(indent));
+            }
+            output.push_str(PUNCTUATION);
+            output.push('}');
+            output.push_str(RESET);
+        }
+        serde_json::Value::Array(values) => {
+            output.push_str(PUNCTUATION);
+            output.push('[');
+            output.push_str(RESET);
+            if !values.is_empty() {
+                output.push('\n');
+            }
+            for (index, value) in values.iter().enumerate() {
+                output.push_str(&" ".repeat(indent + 2));
+                write_colored_json(value, indent + 2, output);
+                if index + 1 != values.len() {
+                    output.push_str(PUNCTUATION);
+                    output.push(',');
+                    output.push_str(RESET);
+                }
+                output.push('\n');
+            }
+            if !values.is_empty() {
+                output.push_str(&" ".repeat(indent));
+            }
+            output.push_str(PUNCTUATION);
+            output.push(']');
+            output.push_str(RESET);
+        }
+        serde_json::Value::String(value) => {
+            output.push_str("\u{1b}[32m");
+            output
+                .push_str(&serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\"")));
+            output.push_str(RESET);
+        }
+        serde_json::Value::Number(value) => {
+            output.push_str("\u{1b}[33m");
+            output.push_str(&value.to_string());
+            output.push_str(RESET);
+        }
+        serde_json::Value::Bool(value) => {
+            output.push_str("\u{1b}[35m");
+            output.push_str(if *value { "true" } else { "false" });
+            output.push_str(RESET);
+        }
+        serde_json::Value::Null => output.push_str("\u{1b}[2mnull\u{1b}[0m"),
+    }
+}
+
+fn colorize_http_method(message: &str) -> String {
+    let Some((method, rest)) = message.split_once(' ') else {
+        return message.to_string();
+    };
+    let color = match method {
+        "GET" | "HEAD" => "36",
+        "POST" => "32",
+        "PUT" => "33",
+        "PATCH" => "35",
+        "DELETE" => "31",
+        "OPTIONS" => "34",
+        _ => return message.to_string(),
+    };
+    format!("\u{1b}[1;{color}m{method}\u{1b}[0m {rest}")
+}
+
+fn colorize_status_field(message: &mut String) {
+    let Some(start) = message.find("status=") else {
+        return;
+    };
+    let value_start = start + "status=".len();
+    let value_end = message[value_start..]
+        .find(|ch: char| !ch.is_ascii_digit())
+        .map_or(message.len(), |offset| value_start + offset);
+    let status = &message[value_start..value_end];
+    let color = match status.as_bytes().first() {
+        Some(b'2' | b'3') => "32",
+        Some(b'4') => "33",
+        Some(b'5') => "31",
+        _ => return,
+    };
+    let replacement = format!("\u{1b}[{color}m{status}\u{1b}[0m");
+    message.replace_range(value_start..value_end, &replacement);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FormattedWorkerLog {
     level: Level,
     message: String,
+    structured: bool,
 }
 
 fn format_worker_log_line(line: &str, fallback_level: Level) -> FormattedWorkerLog {
@@ -575,7 +918,8 @@ fn format_worker_log_line(line: &str, fallback_level: Level) -> FormattedWorkerL
 
         return FormattedWorkerLog {
             level: fallback_level,
-            message: line,
+            message: expand_escaped_whitespace(line),
+            structured: false,
         };
     };
 
@@ -585,28 +929,35 @@ fn format_worker_log_line(line: &str, fallback_level: Level) -> FormattedWorkerL
         .and_then(level_from_severity)
         .unwrap_or(fallback_level);
 
-    let mut message = object
-        .get("message")
-        .or_else(|| object.get("textPayload"))
+    let primary_message = object.get("message").or_else(|| object.get("textPayload"));
+    let mut message = primary_message
         .map(render_log_value)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            serde_json::to_string(&serde_json::Value::Object(object.clone()))
+            serde_json::to_string_pretty(&serde_json::Value::Object(object.clone()))
                 .unwrap_or_else(|_| line.clone())
         });
 
-    let fields = object
-        .iter()
-        .filter(|(key, _)| !is_structured_log_metadata(key))
-        .map(|(key, value)| format!("{key}={}", render_log_value(value)))
-        .collect::<Vec<_>>();
+    let fields = if primary_message.is_some() {
+        object
+            .iter()
+            .filter(|(key, _)| !is_structured_log_metadata(key))
+            .map(|(key, value)| format!("{key}={}", render_log_value(value)))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     if !fields.is_empty() {
         message.push_str(" | ");
         message.push_str(&fields.join(" "));
     }
 
-    FormattedWorkerLog { level, message }
+    FormattedWorkerLog {
+        level,
+        message,
+        structured: true,
+    }
 }
 
 fn format_text_worker_log_line(line: &str, fallback_level: Level) -> Option<FormattedWorkerLog> {
@@ -617,8 +968,13 @@ fn format_text_worker_log_line(line: &str, fallback_level: Level) -> Option<Form
 
     Some(FormattedWorkerLog {
         level,
-        message: message.to_string(),
+        message: expand_escaped_whitespace(message.to_string()),
+        structured: false,
     })
+}
+
+fn expand_escaped_whitespace(value: String) -> String {
+    value.replace("\\n", "\n").replace("\\t", "\t")
 }
 
 fn strip_ansi_sequences(line: &str) -> String {
@@ -692,7 +1048,7 @@ fn is_structured_log_metadata(key: &str) -> bool {
 
 fn render_log_value(value: &serde_json::Value) -> String {
     match value {
-        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::String(value) => expand_escaped_whitespace(value.clone()),
         serde_json::Value::Number(value) => value.to_string(),
         serde_json::Value::Bool(value) => value.to_string(),
         serde_json::Value::Null => "null".to_string(),
@@ -701,17 +1057,32 @@ fn render_log_value(value: &serde_json::Value) -> String {
 }
 
 async fn watch_source(source_dir: PathBuf, reload_tx: mpsc::Sender<()>) {
-    let mut previous = scan_source(&source_dir);
+    let Some(mut previous) = scan_source_async(&source_dir).await else {
+        return;
+    };
 
     loop {
         sleep(Duration::from_millis(500)).await;
-        let current = scan_source(&source_dir);
+        let Some(current) = scan_source_async(&source_dir).await else {
+            return;
+        };
         if current != previous {
             previous = current;
             sleep(Duration::from_millis(150)).await;
             if reload_tx.send(()).await.is_err() {
                 break;
             }
+        }
+    }
+}
+
+async fn scan_source_async(source_dir: &Path) -> Option<BTreeMap<PathBuf, SystemTime>> {
+    let source_dir = source_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || scan_source(&source_dir)).await {
+        Ok(files) => Some(files),
+        Err(error) => {
+            error!(%error, "functions source watcher failed");
+            None
         }
     }
 }
@@ -833,6 +1204,8 @@ exports.api.__trigger = {
   regions: ["us-central1"],
   httpsTrigger: {}
 };
+exports.circular = {};
+exports.circular.self = exports.circular;
 "#,
         );
 
@@ -942,6 +1315,13 @@ exports.api.__trigger = {
         });
 
         let client = reqwest::Client::new();
+        let health = client
+            .get(format!("{base_url}/__/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
         let got: serde_json::Value = client
             .get(format!(
                 "{base_url}/demo-firelite/us-central1/api/users/1?debug=true"
@@ -977,6 +1357,67 @@ exports.api.__trigger = {
         assert_eq!(posted["header"], "post-header");
 
         worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restarts_worker_after_unexpected_exit() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+const fs = require("node:fs");
+const path = require("node:path");
+const marker = path.join(__dirname, ".crashed-once");
+if (!fs.existsSync(marker)) {
+  fs.writeFileSync(marker, "yes");
+  setTimeout(() => process.exit(17), 50);
+}
+exports.api = (req, res) => res.end("ok");
+exports.api.__trigger = {
+  name: "api",
+  regions: ["us-central1"],
+  httpsTrigger: {}
+};
+"#,
+        );
+
+        let started = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
+        let active = Arc::new(RwLock::new(Some(started.active)));
+        let (reload_tx, reload_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(supervise_workers(
+            "demo-firelite".to_string(),
+            dir,
+            Vec::new(),
+            active.clone(),
+            reload_rx,
+            started.child,
+            1,
+        ));
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if active
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|worker| worker.generation >= 2)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("worker should restart");
+
+        drop(reload_tx);
+        supervisor.abort();
+        let _ = supervisor.await;
     }
 
     #[tokio::test]
@@ -1164,6 +1605,7 @@ exports.tasks.runJob.__endpoint = {
             FormattedWorkerLog {
                 level: Level::INFO,
                 message: "created user | attempt=2 uid=alice".to_string(),
+                structured: true,
             }
         );
     }
@@ -1177,7 +1619,132 @@ exports.tasks.runJob.__endpoint = {
             FormattedWorkerLog {
                 level: Level::WARN,
                 message: "plain stderr line".to_string(),
+                structured: false,
             }
+        );
+    }
+
+    #[test]
+    fn expands_escaped_stack_trace_lines() {
+        let formatted = format_worker_log_line(
+            r#"Error: failed\n    at handler (index.js:10:2)\n    at processTask (index.js:20:4)"#,
+            Level::ERROR,
+        );
+
+        assert_eq!(
+            formatted.message,
+            "Error: failed\n    at handler (index.js:10:2)\n    at processTask (index.js:20:4)"
+        );
+    }
+
+    #[test]
+    fn pretty_prints_structured_logs_without_a_message_field() {
+        let formatted = format_worker_log_line(
+            r#"{"executionId":"request-1","data":{"durationMillis":1,"statusCode":400}}"#,
+            Level::INFO,
+        );
+
+        assert_eq!(
+            formatted.message,
+            "{\n  \"data\": {\n    \"durationMillis\": 1,\n    \"statusCode\": 400\n  },\n  \"executionId\": \"request-1\"\n}"
+        );
+    }
+
+    #[test]
+    fn compacts_trpc_request_context() {
+        let record = r#"trpc endpoint success
+  executionId: "emulatorRequest:abc",
+  sessionId: "session-1",
+  userId: "user-1",
+  data: {
+    "path": "admin.userRent.listUserRents",
+    "type": "mutation",
+    "durationMillis": 348
+  }
+}"#;
+
+        assert_eq!(
+            compact_worker_record(record),
+            "trpc endpoint success path=admin.userRent.listUserRents type=mutation duration=348ms"
+        );
+    }
+
+    #[test]
+    fn compacts_request_context_with_escaped_newlines() {
+        let record = expand_escaped_whitespace(
+            r#"trpc endpoint success\n  executionId: "request-1",\n  data: {\n    "path": "admin.users.list",\n    "durationMillis": 12\n  }"#.to_string(),
+        );
+
+        assert_eq!(
+            compact_worker_record(&record),
+            "trpc endpoint success path=admin.users.list duration=12ms"
+        );
+    }
+
+    #[test]
+    fn compacts_response_context() {
+        let record = r#"Response
+  executionId: "emulatorRequest:abc",
+  sessionId: "session-1",
+  userId: "user-1",
+  data: {
+    "durationMillis": 406,
+    "endpoint": "/admin.userRent.listUserRents",
+    "statusCode": 200
+  }
+}"#;
+
+        assert_eq!(
+            compact_worker_record(record),
+            "Response duration=406ms endpoint=/admin.userRent.listUserRents status=200"
+        );
+    }
+
+    #[test]
+    fn colors_http_methods_and_statuses_for_terminals() {
+        assert_eq!(
+            decorate_worker_message("GET /api/users 200 - 4ms", Level::INFO, false, true),
+            "\u{1b}[1;36mGET\u{1b}[0m /api/users 200 - 4ms"
+        );
+        assert_eq!(
+            decorate_worker_message("POST /api/users 201 - 8ms", Level::INFO, false, true),
+            "\u{1b}[1;32mPOST\u{1b}[0m /api/users 201 - 8ms"
+        );
+        assert_eq!(
+            decorate_worker_message(
+                "Response endpoint=/api/users status=500",
+                Level::INFO,
+                false,
+                true,
+            ),
+            "Response endpoint=/api/users status=\u{1b}[31m500\u{1b}[0m"
+        );
+    }
+
+    #[test]
+    fn syntax_highlights_structured_json_logs() {
+        let formatted = format_worker_log_line(
+            r#"{"severity":"WARN","data":{"ok":false,"attempt":2},"name":"worker"}"#,
+            Level::INFO,
+        );
+        let decorated = decorate_worker_message(
+            &formatted.message,
+            formatted.level,
+            formatted.structured,
+            true,
+        );
+
+        assert!(decorated.contains("\u{1b}[36m\"data\"\u{1b}[0m"));
+        assert!(decorated.contains("\u{1b}[35mfalse\u{1b}[0m"));
+        assert!(decorated.contains("\u{1b}[33m2\u{1b}[0m"));
+        assert!(decorated.contains("\u{1b}[32m\"worker\"\u{1b}[0m"));
+    }
+
+    #[test]
+    fn keeps_redirected_logs_free_of_ansi_codes() {
+        assert_eq!(
+            decorate_worker_message("DELETE /api/users/1 204 - 3ms", Level::INFO, false, false),
+            "DELETE /api/users/1 204 - 3ms"
         );
     }
 
@@ -1193,36 +1760,9 @@ exports.tasks.runJob.__endpoint = {
             FormattedWorkerLog {
                 level: Level::DEBUG,
                 message: "Updating user".to_string(),
+                structured: false,
             }
         );
-    }
-
-    #[tokio::test]
-    async fn build_command_can_generate_loadable_javascript() {
-        if !node_can_start_loopback_server().await {
-            return;
-        }
-
-        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        write_file(&dir.join("index.ts"), "// pretend TypeScript source\n");
-
-        run_build_command(
-            Some(
-                r#"printf '%s\n' 'exports.api = (req, res) => res.end("built");' 'exports.api.__trigger = { name: "api", regions: ["us-central1"], httpsTrigger: {} };' > index.js"#,
-            ),
-            &dir,
-            1,
-        )
-        .await
-        .unwrap();
-
-        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
-        assert!(worker.active.http_functions.contains_key(&FunctionKey {
-            region: "us-central1".to_string(),
-            name: "api".to_string(),
-        }));
-        worker.child.kill().await.unwrap();
     }
 
     fn write_file(path: &Path, contents: &str) {

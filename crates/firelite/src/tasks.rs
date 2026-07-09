@@ -1,5 +1,6 @@
 use crate::{
-    control::find_attachment_for_function, functions::is_hop_by_hop_header, server::AppState,
+    functions::{function_id_matches_filter, is_hop_by_hop_header},
+    server::AppState,
 };
 use axum::{
     body::Bytes,
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::info;
 
@@ -43,6 +44,21 @@ pub fn router() -> Router<SharedState> {
 #[derive(Debug, Clone, Default)]
 pub struct TasksState {
     tasks: Arc<RwLock<BTreeMap<String, TaskRecord>>>,
+    functions_target: Arc<RwLock<Option<FunctionsTarget>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionsTarget {
+    pub project_id: String,
+    pub functions_host: String,
+    pub functions_port: u16,
+    pub filters: Vec<String>,
+}
+
+impl TasksState {
+    pub fn set_functions_target(&self, target: FunctionsTarget) {
+        *self.functions_target.write().expect("tasks state poisoned") = Some(target);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,15 +267,11 @@ async fn dispatch_task(
     {
         Some(url) => url.to_string(),
         None => {
-            let attachment = find_attachment_for_function(state, project_id, queue_id)
-                .ok_or_else(|| error(StatusCode::NOT_FOUND, "NO_ATTACHED_FUNCTIONS_WORKER"))?;
+            let target = find_functions_target(state, project_id, queue_id)
+                .ok_or_else(|| error(StatusCode::NOT_FOUND, "NO_FUNCTIONS_WORKER"))?;
             format!(
                 "http://{}:{}/{}/{}/{}",
-                attachment.functions_host,
-                attachment.functions_port,
-                project_id,
-                location_id,
-                queue_id
+                target.functions_host, target.functions_port, project_id, location_id, queue_id
             )
         }
     };
@@ -270,11 +282,16 @@ async fn dispatch_task(
         .unwrap_or("POST")
         .parse::<reqwest::Method>()
         .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_HTTP_METHOD"))?;
+    validate_task_target(&target)?;
     let body = decode_body(task.http_request.body.as_deref())?;
     let task_name = task.name.as_deref().unwrap_or("");
     let queue_name = queue_name(project_id, location_id, queue_id);
 
-    let mut request = state.http_client.request(method, target.clone()).body(body);
+    let mut request = state
+        .http_client
+        .request(method, target.clone())
+        .timeout(task_dispatch_timeout(task.dispatch_deadline.as_ref()))
+        .body(body);
     for (name, value) in &task.http_request.headers {
         if is_hop_by_hop_header(name) {
             continue;
@@ -321,6 +338,52 @@ fn decode_body(body: Option<&str>) -> Result<Bytes, TasksError> {
         .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_TASK_BODY"))
 }
 
+fn validate_task_target(target: &str) -> Result<(), TasksError> {
+    let url = reqwest::Url::parse(target)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_TASK_URL"))?;
+    if url.scheme() != "http" {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "UNSUPPORTED_TASK_URL_SCHEME",
+        ));
+    }
+    if url.host().is_none() {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_TASK_URL"));
+    }
+    Ok(())
+}
+
+fn task_dispatch_timeout(value: Option<&serde_json::Value>) -> Duration {
+    const DEFAULT_SECONDS: f64 = 30.0;
+    const MAX_SECONDS: f64 = 1_800.0;
+
+    let seconds = value
+        .and_then(parse_duration_seconds)
+        .unwrap_or(DEFAULT_SECONDS)
+        .clamp(0.001, MAX_SECONDS);
+    Duration::from_secs_f64(seconds)
+}
+
+fn parse_duration_seconds(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::String(value) => value.strip_suffix('s')?.parse().ok(),
+        serde_json::Value::Number(value) => value.as_f64(),
+        serde_json::Value::Object(value) => {
+            let seconds = value.get("seconds").and_then(json_f64).unwrap_or(0.0);
+            let nanos = value.get("nanos").and_then(json_f64).unwrap_or(0.0);
+            Some(seconds + nanos / 1_000_000_000.0)
+        }
+        _ => None,
+    }
+    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+}
+
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
 fn update_task_status(state: &SharedState, name: &str, status: TaskStatus) {
     if let Some(record) = state
         .tasks
@@ -332,6 +395,28 @@ fn update_task_status(state: &SharedState, name: &str, status: TaskStatus) {
         record.status = status;
         record.dispatched_at_ms = Some(now_ms());
     }
+}
+
+fn find_functions_target(
+    state: &SharedState,
+    project_id: &str,
+    function_name: &str,
+) -> Option<FunctionsTarget> {
+    state
+        .tasks
+        .functions_target
+        .read()
+        .expect("tasks state poisoned")
+        .as_ref()
+        .filter(|target| {
+            target.project_id == project_id
+                && (target.filters.is_empty()
+                    || target
+                        .filters
+                        .iter()
+                        .any(|filter| function_id_matches_filter(function_name, filter)))
+        })
+        .cloned()
 }
 
 fn queue_name(project_id: &str, location_id: &str, queue_id: &str) -> String {
@@ -363,4 +448,37 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dispatch_deadlines_and_applies_bounds() {
+        assert_eq!(
+            task_dispatch_timeout(Some(&serde_json::json!("1.5s"))),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            task_dispatch_timeout(Some(&serde_json::json!({
+                "seconds": "2",
+                "nanos": 250_000_000
+            }))),
+            Duration::from_millis(2_250)
+        );
+        assert_eq!(
+            task_dispatch_timeout(Some(&serde_json::json!("9999s"))),
+            Duration::from_secs(1_800)
+        );
+    }
+
+    #[test]
+    fn task_targets_are_local_http_only() {
+        assert!(validate_task_target("http://127.0.0.1:5001/task").is_ok());
+
+        let error = validate_task_target("https://example.test/task").unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "UNSUPPORTED_TASK_URL_SCHEME");
+    }
 }

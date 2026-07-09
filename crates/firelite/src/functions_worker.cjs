@@ -203,18 +203,19 @@ function resolveEntrypoint(source) {
 
 function discoverFunctions(rootExports) {
   const found = [];
+  const seen = new WeakSet();
 
   walk(rootExports, [], (entryId, value) => {
     const descriptor = describeFunction(entryId, value);
     if (descriptor) {
       found.push(descriptor);
     }
-  });
+  }, seen);
 
   return found;
 }
 
-function walk(value, pathParts, visit) {
+function walk(value, pathParts, visit, seen) {
   if (typeof value === "function") {
     visit(pathParts.join("."), value);
     return;
@@ -223,9 +224,13 @@ function walk(value, pathParts, visit) {
   if (!value || typeof value !== "object") {
     return;
   }
+  if (seen.has(value)) {
+    return;
+  }
+  seen.add(value);
 
   for (const [key, child] of Object.entries(value)) {
-    walk(child, pathParts.concat(key), visit);
+    walk(child, pathParts.concat(key), visit, seen);
   }
 }
 

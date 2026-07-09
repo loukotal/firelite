@@ -1,6 +1,5 @@
 pub mod auth;
 pub mod config;
-pub mod control;
 pub mod functions;
 pub mod pubsub;
 pub mod server;

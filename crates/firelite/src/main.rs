@@ -1,13 +1,16 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use firelite::{
-    config::DaemonConfig,
-    control::{AttachRequest, AttachmentsResponse},
-    functions::FunctionsConfig,
-    server,
+use firelite::{config::DaemonConfig, functions::FunctionsConfig, server, tasks::FunctionsTarget};
+use std::{fmt, io::IsTerminal, net::SocketAddr, path::PathBuf};
+use tracing::{field::Visit, Event, Level, Subscriber};
+use tracing_subscriber::{
+    fmt::{
+        format::{FormatEvent, FormatFields, Writer},
+        time::{FormatTime, SystemTime},
+        FmtContext,
+    },
+    registry::LookupSpan,
 };
-use std::{net::SocketAddr, path::PathBuf};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Debug, Parser)]
 #[command(name = "firelite")]
@@ -26,31 +29,6 @@ enum Command {
         #[arg(long, default_value_t = 9099)]
         port: u16,
     },
-    /// Register a checkout/workdir against a project namespace.
-    Attach {
-        #[arg(long)]
-        project: String,
-        #[arg(long)]
-        workdir: PathBuf,
-        #[arg(long, default_value = "127.0.0.1")]
-        daemon_host: String,
-        #[arg(long, default_value_t = 9099)]
-        daemon_port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        functions_host: String,
-        #[arg(long, default_value_t = 5001)]
-        functions_port: u16,
-        /// Function export/name filter. Can be repeated.
-        #[arg(long = "filter")]
-        filters: Vec<String>,
-    },
-    /// List functions workers attached to the daemon.
-    Attachments {
-        #[arg(long, default_value = "127.0.0.1")]
-        daemon_host: String,
-        #[arg(long, default_value_t = 9099)]
-        daemon_port: u16,
-    },
     /// Reset state for a project namespace.
     Reset {
         #[arg(long)]
@@ -66,19 +44,12 @@ enum Command {
         port: u16,
         #[arg(long)]
         watch: PathBuf,
-        /// Command to run in the watched functions directory before loading/reloading workers.
-        #[arg(long)]
-        build_command: Option<String>,
         /// Function export/name filter. Can be repeated.
         #[arg(long = "filter")]
         filters: Vec<String>,
-        /// Register this functions worker with a running daemon.
+        /// Disable source polling and automatic worker reloads.
         #[arg(long)]
-        attach: bool,
-        #[arg(long, default_value = "127.0.0.1")]
-        daemon_host: String,
-        #[arg(long, default_value_t = 9099)]
-        daemon_port: u16,
+        no_reload: bool,
     },
     /// Run Auth, Storage, Pub/Sub, Cloud Tasks, and Cloud Functions emulators together.
     Emulators {
@@ -98,12 +69,12 @@ enum Command {
         functions_port: u16,
         #[arg(long)]
         watch: PathBuf,
-        /// Command to run in the watched functions directory before loading/reloading workers.
-        #[arg(long)]
-        build_command: Option<String>,
         /// Function export/name filter. Can be repeated.
         #[arg(long = "filter")]
         filters: Vec<String>,
+        /// Disable source polling and automatic worker reloads. Recommended in CI.
+        #[arg(long)]
+        no_reload: bool,
     },
 }
 
@@ -116,30 +87,6 @@ async fn main() -> anyhow::Result<()> {
             let addr = parse_addr("daemon", &host, port)?;
             server::serve(DaemonConfig { addr }).await
         }
-        Command::Attach {
-            project,
-            workdir,
-            daemon_host,
-            daemon_port,
-            functions_host,
-            functions_port,
-            filters,
-        } => {
-            attach_worker(
-                project,
-                workdir,
-                daemon_host,
-                daemon_port,
-                functions_host,
-                functions_port,
-                filters,
-            )
-            .await
-        }
-        Command::Attachments {
-            daemon_host,
-            daemon_port,
-        } => list_attachments(daemon_host, daemon_port).await,
         Command::Reset { project } => {
             println!("reset is scaffolded: project={project}");
             Ok(())
@@ -149,31 +96,16 @@ async fn main() -> anyhow::Result<()> {
             host,
             port,
             watch,
-            build_command,
             filters,
-            attach,
-            daemon_host,
-            daemon_port,
+            no_reload,
         } => {
             let addr = parse_addr("functions", &host, port)?;
-            if attach {
-                attach_worker(
-                    project.clone(),
-                    watch.clone(),
-                    daemon_host,
-                    daemon_port,
-                    host.clone(),
-                    port,
-                    filters.clone(),
-                )
-                .await?;
-            }
             firelite::functions::serve(FunctionsConfig {
                 project_id: project,
                 source_dir: watch,
                 addr,
-                build_command,
                 filters,
+                reload_on_change: !no_reload,
             })
             .await
         }
@@ -186,40 +118,37 @@ async fn main() -> anyhow::Result<()> {
             tasks_port,
             functions_port,
             watch,
-            build_command,
             filters,
+            no_reload,
         } => {
             let state = server::app_state();
             let daemon_addr = parse_addr("auth daemon", &host, auth_port)?;
             let pubsub_addr = parse_addr("pubsub", &host, pubsub_port)?;
             let tasks_addr = parse_addr("cloud tasks", &host, tasks_port)?;
             let functions_addr = parse_addr("functions", &host, functions_port)?;
-            let workdir = std::fs::canonicalize(&watch).unwrap_or_else(|_| watch.clone());
 
-            firelite::control::register_attachment(
-                &state,
-                AttachRequest {
-                    project_id: project.clone(),
-                    workdir: workdir.display().to_string(),
-                    functions_host: host.clone(),
-                    functions_port,
-                    filters: filters.clone(),
-                },
-            )
-            .map_err(|status| anyhow::anyhow!("failed to register functions worker: {status}"))?;
+            let functions = firelite::functions::prepare(FunctionsConfig {
+                project_id: project.clone(),
+                source_dir: watch,
+                addr: functions_addr,
+                filters: filters.clone(),
+                reload_on_change: !no_reload,
+            })
+            .await?;
+
+            state.tasks.set_functions_target(FunctionsTarget {
+                project_id: project,
+                functions_host: host.clone(),
+                functions_port,
+                filters,
+            });
 
             let daemon = server::serve_with_state(
                 "firelite auth emulator",
                 DaemonConfig { addr: daemon_addr },
                 state.clone(),
             );
-            let functions = firelite::functions::serve(FunctionsConfig {
-                project_id: project,
-                source_dir: watch,
-                addr: functions_addr,
-                build_command,
-                filters,
-            });
+            let functions = functions.serve();
             let tasks =
                 server::serve_tasks_with_state(DaemonConfig { addr: tasks_addr }, state.clone());
             let pubsub =
@@ -246,110 +175,115 @@ fn parse_addr(label: &str, host: &str, port: u16) -> anyhow::Result<SocketAddr> 
         .with_context(|| format!("invalid {label} address {host}:{port}"))
 }
 
-async fn attach_worker(
-    project: String,
-    workdir: PathBuf,
-    daemon_host: String,
-    daemon_port: u16,
-    functions_host: String,
-    functions_port: u16,
-    filters: Vec<String>,
-) -> anyhow::Result<()> {
-    let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
-    let daemon_url = daemon_base_url(&daemon_host, daemon_port);
-    let request = AttachRequest {
-        project_id: project,
-        workdir: workdir.display().to_string(),
-        functions_host,
-        functions_port,
-        filters,
-    };
-
-    let attachment = reqwest::Client::new()
-        .post(format!("{daemon_url}/__/control/attachments"))
-        .json(&request)
-        .send()
-        .await
-        .with_context(|| format!("failed to reach firelite daemon at {daemon_url}"))?
-        .error_for_status()
-        .context("firelite daemon rejected attach request")?
-        .json::<firelite::control::FunctionAttachment>()
-        .await
-        .context("failed to parse attach response")?;
-
-    println!(
-        "attached functions worker: id={} project={} workdir={} functions={}:{} filters={}",
-        attachment.id,
-        attachment.project_id,
-        attachment.workdir,
-        attachment.functions_host,
-        attachment.functions_port,
-        render_filters(&attachment.filters)
-    );
-
-    Ok(())
-}
-
-async fn list_attachments(daemon_host: String, daemon_port: u16) -> anyhow::Result<()> {
-    let daemon_url = daemon_base_url(&daemon_host, daemon_port);
-    let response = reqwest::Client::new()
-        .get(format!("{daemon_url}/__/control/attachments"))
-        .send()
-        .await
-        .with_context(|| format!("failed to reach firelite daemon at {daemon_url}"))?
-        .error_for_status()
-        .context("firelite daemon rejected attachments request")?
-        .json::<AttachmentsResponse>()
-        .await
-        .context("failed to parse attachments response")?;
-
-    if response.attachments.is_empty() {
-        println!("no attached functions workers");
-        return Ok(());
-    }
-
-    for attachment in response.attachments {
-        println!(
-            "{} project={} workdir={} functions={}:{} filters={}",
-            attachment.id,
-            attachment.project_id,
-            attachment.workdir,
-            attachment.functions_host,
-            attachment.functions_port,
-            render_filters(&attachment.filters)
-        );
-    }
-
-    Ok(())
-}
-
-fn daemon_base_url(host: &str, port: u16) -> String {
-    let host = host.trim_end_matches('/');
-    if host.starts_with("http://") || host.starts_with("https://") {
-        let authority = host.split("://").nth(1).unwrap_or(host);
-        if authority.contains(':') {
-            host.to_string()
-        } else {
-            format!("{host}:{port}")
-        }
-    } else {
-        format!("http://{host}:{port}")
-    }
-}
-
-fn render_filters(filters: &[String]) -> String {
-    if filters.is_empty() {
-        "all".to_string()
-    } else {
-        filters.join(",")
-    }
-}
-
 fn init_tracing() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("firelite=info"));
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|value| parse_log_level(&value))
+        .unwrap_or(Level::INFO);
+    tracing_subscriber::fmt()
+        .event_format(CompactLogFormatter {
+            color: terminal_colors_enabled(),
+        })
+        .with_max_level(level)
         .init();
+}
+
+struct CompactLogFormatter {
+    color: bool,
+}
+
+impl<S, N> FormatEvent<S, N> for CompactLogFormatter
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        if self.color {
+            write!(writer, "\u{1b}[2;90m")?;
+        }
+        SystemTime.format_time(&mut writer)?;
+        if self.color {
+            write!(writer, "\u{1b}[0m")?;
+        }
+        writer.write_char(' ')?;
+
+        if event.metadata().target() == "firelite_worker" {
+            let mut visitor = WorkerMessageVisitor::default();
+            event.record(&mut visitor);
+            if let Some(message) = visitor.message {
+                return writeln!(writer, "{message}");
+            }
+        }
+
+        context
+            .field_format()
+            .format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+fn terminal_colors_enabled() -> bool {
+    let forced = std::env::var("FORCE_COLOR")
+        .ok()
+        .is_some_and(|value| value != "0");
+    forced
+        || (std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM").ok().as_deref() != Some("dumb")
+            && (std::io::stderr().is_terminal() || std::env::var_os("HERDR_ENV").is_some()))
+}
+
+#[derive(Default)]
+struct WorkerMessageVisitor {
+    message: Option<String>,
+}
+
+impl Visit for WorkerMessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "worker_message" {
+            self.message = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        if field.name() == "worker_message" && self.message.is_none() {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+}
+
+fn parse_log_level(value: &str) -> Option<Level> {
+    let mut global = None;
+    let mut firelite = None;
+
+    for directive in value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match directive.split_once('=') {
+            Some((target, level)) if target.trim() == "firelite" => {
+                firelite = level_from_str(level);
+            }
+            None => global = level_from_str(directive),
+            _ => {}
+        }
+    }
+
+    firelite.or(global)
+}
+
+fn level_from_str(value: &str) -> Option<Level> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "trace" => Some(Level::TRACE),
+        "debug" => Some(Level::DEBUG),
+        "info" => Some(Level::INFO),
+        "warn" => Some(Level::WARN),
+        "error" => Some(Level::ERROR),
+        _ => None,
+    }
 }

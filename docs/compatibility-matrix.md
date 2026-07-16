@@ -10,6 +10,7 @@ Status legend:
 | Service | Surface | Status | Notes |
 | --- | --- | --- | --- |
 | Auth | `accounts:signUp` password user create | implemented | In-memory, default project `demo-firelite` for Identity Toolkit paths. |
+| Auth | `signInAnonymously` / anonymous `accounts:signUp` | implemented | Anonymous account lookup, refresh, token claims, and deletion are SDK-tested. |
 | Auth | `accounts:signInWithPassword` | implemented | Password hash is local-only and not production-compatible. |
 | Auth | `accounts:lookup` by ID token/local ID | implemented | Unsigned local JWT-like token, sufficient for local contract flow. |
 | Auth | `accounts:delete` | implemented | Supports `localId` or `idToken`. |
@@ -25,7 +26,8 @@ Status legend:
 | Cloud Tasks | Functions task queue dispatch | implemented | In `firelite emulators`, dispatches task queue requests directly to the local functions worker matching the queue/function name. Basic version is synchronous and single-attempt. |
 | Pub/Sub | topic/subscription CRUD and publish/pull/acknowledge | implemented | HTTP/JSON emulator subset, in-memory and project-scoped. Full SDK gRPC behavior still needs discovery. |
 | Pub/Sub | push delivery to Functions emulator | unknown | Needs event flow capture. |
-| Storage | JSON API media upload/download/list/delete | implemented | In-memory object state with `/upload/storage/v1`, `/storage/v1`, and Firebase `/v0` object paths. Defer XML API, resumable uploads, and full Firebase Security Rules fidelity. |
+| Storage | JSON API media upload/download/list/delete | implemented | In-memory object state with `/upload/storage/v1`, `/storage/v1`, and Firebase `/v0` object paths. Defer XML API and full Firebase Security Rules fidelity. |
+| Storage | Firebase Web SDK resumable uploads | implemented | Supports start, chunk upload, offset query, and finalization through `X-Goog-Upload-*`. |
 | Storage | Emulator bucket object inspection/reset | implemented | `/emulator/v1/projects/{project}/storage/buckets/{bucket}/objects` supports list/reset for local tests. |
 | Storage | Functions object events | unknown | Needs event flow capture. |
 | Functions | HTTP/callable export discovery and proxying | implemented | `firelite functions` starts a checkout-local Node worker, reads gen1/gen2 metadata, and serves `/{project}/{region}/{function}` URLs. |

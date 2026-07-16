@@ -4,7 +4,8 @@ use axum::{
     extract::Request,
     http::{
         header::{
-            ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+            ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+            ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS,
         },
         HeaderValue, Method, StatusCode,
     },
@@ -178,7 +179,13 @@ async fn add_cors_headers(request: Request, next: Next) -> Response {
     headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
         HeaderValue::from_static(
-            "authorization,content-type,x-client-version,x-firebase-appcheck,x-firebase-client,x-firebase-client-log-type,x-firebase-gmpid,x-firebase-locale,x-firebase-storage-version,x-goog-api-client,x-goog-upload-command,x-goog-upload-header-content-length,x-goog-upload-header-content-type,x-goog-upload-protocol,x-goog-user-project",
+            "authorization,content-type,x-client-version,x-firebase-appcheck,x-firebase-client,x-firebase-client-log-type,x-firebase-gmpid,x-firebase-locale,x-firebase-storage-version,x-goog-api-client,x-goog-upload-command,x-goog-upload-header-content-length,x-goog-upload-header-content-type,x-goog-upload-offset,x-goog-upload-protocol,x-goog-user-project",
+        ),
+    );
+    headers.insert(
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static(
+            "x-goog-upload-status,x-goog-upload-url,x-goog-upload-size-received",
         ),
     );
     response

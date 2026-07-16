@@ -91,6 +91,81 @@ async fn auth_create_sign_in_list_delete_flow() {
 }
 
 #[tokio::test]
+async fn auth_anonymous_signup_lookup_refresh_and_delete_flow() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake"
+        ))
+        .json(&json!({ "returnSecureToken": true }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(created.get("email").is_none());
+    let claims = decode_jwt_payload(created["idToken"].as_str().unwrap());
+    assert_eq!(claims["firebase"]["sign_in_provider"], "anonymous");
+    assert_eq!(claims["firebase"]["identities"], json!({}));
+    assert!(claims.get("email").is_none());
+
+    let lookup: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=fake"
+        ))
+        .json(&json!({ "idToken": created["idToken"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(lookup["users"][0].get("email").is_none());
+    assert!(lookup["users"][0].get("passwordHash").is_none());
+    assert_eq!(lookup["users"][0]["providerUserInfo"], json!([]));
+
+    let refreshed: Value = client
+        .post(format!(
+            "{base_url}/securetoken.googleapis.com/v1/token?key=fake"
+        ))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", created["refreshToken"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let refreshed_claims = decode_jwt_payload(refreshed["id_token"].as_str().unwrap());
+    assert_eq!(
+        refreshed_claims["firebase"]["sign_in_provider"],
+        "anonymous"
+    );
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:delete?key=fake"
+        ))
+        .json(&json!({ "idToken": created["idToken"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn auth_secure_token_refresh_supports_browser_sdk_cors_flow() {
     let base_url = spawn_app().await;
     let client = reqwest::Client::new();

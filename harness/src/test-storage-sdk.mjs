@@ -11,7 +11,8 @@ import {
   getStorage,
   listAll,
   ref,
-  uploadBytes
+  uploadBytes,
+  uploadBytesResumable
 } from "firebase/storage";
 
 const repoRoot = new URL("../../", import.meta.url);
@@ -72,6 +73,13 @@ try {
 
   await deleteObject(objectRef);
   await assert.rejects(() => getMetadata(objectRef));
+
+  const resumableRef = ref(storage, `sdk/${Date.now()}/lease.pdf`);
+  const resumableBytes = new Uint8Array(300_000).fill(42);
+  const resumable = await uploadBytesResumable(resumableRef, resumableBytes, {
+    contentType: "application/pdf"
+  });
+  assert.equal(resumable.metadata.size, resumableBytes.length);
 
   await deleteApp(app);
   console.log("firebase/storage SDK E2E passed");

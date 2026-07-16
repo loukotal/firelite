@@ -42,11 +42,15 @@ pub fn router() -> Router<SharedState> {
         )
         .route(
             "/v0/b/:bucket/o",
-            get(list_firebase_objects).post(upload_firebase_object),
+            get(list_firebase_objects)
+                .post(upload_firebase_object)
+                .options(storage_preflight),
         )
         .route(
             "/v0/b/:bucket/o/*object",
-            get(get_firebase_object).delete(delete_firebase_object),
+            get(get_firebase_object)
+                .delete(delete_firebase_object)
+                .options(storage_preflight),
         )
         .route(
             "/emulator/v1/projects/:project_id/storage/buckets/:bucket/objects",
@@ -86,6 +90,10 @@ struct ResumableUploadSession {
     bucket: String,
     name: String,
     content_type: String,
+    expected_length: Option<usize>,
+    data: Vec<u8>,
+    received: usize,
+    finalized: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +184,10 @@ impl IntoResponse for StorageError {
 
 type StorageResult<T> = Result<Json<T>, StorageError>;
 
+async fn storage_preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 async fn upload_gcs_object(
     State(state): State<SharedState>,
     Path(bucket): Path<String>,
@@ -247,9 +259,19 @@ async fn upload_firebase_object(
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
     body: Bytes,
-) -> StorageResult<ObjectMetadata> {
+) -> Result<Response, StorageError> {
+    if headers
+        .get("x-goog-upload-protocol")
+        .and_then(|value| value.to_str().ok())
+        == Some("resumable")
+    {
+        return start_firebase_resumable_upload(&state, &bucket, query.name, headers, body);
+    }
+    if let Some(upload_id) = query.upload_id {
+        return handle_firebase_resumable_upload(&state, &bucket, &upload_id, headers, body);
+    }
     let upload = parse_upload(query.name, headers, body)?;
-    upload_object(&state, &infer_project_id(&bucket), &bucket, upload)
+    Ok(upload_object(&state, &infer_project_id(&bucket), &bucket, upload)?.into_response())
 }
 
 async fn list_gcs_objects(
@@ -360,6 +382,10 @@ fn start_resumable_upload(
                 bucket: bucket.to_string(),
                 name,
                 content_type,
+                expected_length: None,
+                data: Vec::new(),
+                received: 0,
+                finalized: false,
             },
         );
 
@@ -376,6 +402,197 @@ fn start_resumable_upload(
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INVALID_UPLOAD_LOCATION"))?,
     );
     Ok((StatusCode::OK, response_headers, Json(EmptyResponse {})).into_response())
+}
+
+fn start_firebase_resumable_upload(
+    state: &SharedState,
+    bucket: &str,
+    query_name: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StorageError> {
+    let metadata: Option<UploadMetadata> = if body.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_slice(&body)
+                .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_RESUMABLE_METADATA"))?,
+        )
+    };
+    let name = query_name
+        .or_else(|| metadata.as_ref().and_then(|value| value.name.clone()))
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_OBJECT_NAME"))?;
+    let content_type = headers
+        .get("x-goog-upload-header-content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .or_else(|| metadata.and_then(|value| value.content_type))
+        .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string());
+    let expected_length = headers
+        .get("x-goog-upload-header-content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_UPLOAD_LENGTH"))
+        })
+        .transpose()?;
+    let upload_id = Uuid::new_v4().to_string();
+    state
+        .storage
+        .resumable_uploads
+        .write()
+        .expect("storage state poisoned")
+        .insert(
+            upload_id.clone(),
+            ResumableUploadSession {
+                project_id: infer_project_id(bucket),
+                bucket: bucket.to_string(),
+                name,
+                content_type,
+                expected_length,
+                data: Vec::new(),
+                received: 0,
+                finalized: false,
+            },
+        );
+
+    let upload_url = format!(
+        "{}/v0/b/{}/o?upload_id={}",
+        request_base_url(&headers),
+        percent_encode_path_segment(bucket),
+        percent_encode_query(&upload_id)
+    );
+    let mut response_headers = HeaderMap::new();
+    insert_header(&mut response_headers, "x-goog-upload-status", "active")?;
+    insert_header(&mut response_headers, "x-goog-upload-url", &upload_url)?;
+    Ok((StatusCode::OK, response_headers).into_response())
+}
+
+fn handle_firebase_resumable_upload(
+    state: &SharedState,
+    bucket: &str,
+    upload_id: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StorageError> {
+    let command = headers
+        .get("x-goog-upload-command")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_UPLOAD_COMMAND"))?;
+    let commands = command.split(',').map(str::trim).collect::<Vec<_>>();
+
+    if commands.contains(&"query") {
+        let sessions = state
+            .storage
+            .resumable_uploads
+            .read()
+            .expect("storage state poisoned");
+        let session = sessions
+            .get(upload_id)
+            .filter(|session| session.bucket == bucket)
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, "UPLOAD_SESSION_NOT_FOUND"))?;
+        let mut response_headers = HeaderMap::new();
+        insert_header(
+            &mut response_headers,
+            "x-goog-upload-status",
+            if session.finalized { "final" } else { "active" },
+        )?;
+        insert_header(
+            &mut response_headers,
+            "x-goog-upload-size-received",
+            &session.received.to_string(),
+        )?;
+        return Ok((StatusCode::OK, response_headers).into_response());
+    }
+
+    let should_upload = commands.contains(&"upload");
+    let should_finalize = commands.contains(&"finalize");
+    if !should_upload && !should_finalize {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_UPLOAD_COMMAND"));
+    }
+
+    let mut sessions = state
+        .storage
+        .resumable_uploads
+        .write()
+        .expect("storage state poisoned");
+    let session = sessions
+        .get_mut(upload_id)
+        .filter(|session| session.bucket == bucket)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "UPLOAD_SESSION_NOT_FOUND"))?;
+    if session.finalized {
+        return Err(error(StatusCode::BAD_REQUEST, "UPLOAD_ALREADY_FINALIZED"));
+    }
+    let offset = headers
+        .get("x-goog-upload-offset")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_UPLOAD_OFFSET"))?
+        .parse::<usize>()
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_UPLOAD_OFFSET"))?;
+    if offset != session.received {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_UPLOAD_OFFSET"));
+    }
+    if should_upload {
+        let resulting_length = session
+            .received
+            .checked_add(body.len())
+            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_UPLOAD_LENGTH"))?;
+        if session
+            .expected_length
+            .is_some_and(|expected| resulting_length > expected)
+        {
+            return Err(error(StatusCode::BAD_REQUEST, "INVALID_UPLOAD_LENGTH"));
+        }
+        session.data.extend_from_slice(&body);
+        session.received = resulting_length;
+    }
+
+    if !should_finalize {
+        let mut response_headers = HeaderMap::new();
+        insert_header(&mut response_headers, "x-goog-upload-status", "active")?;
+        return Ok((StatusCode::OK, response_headers).into_response());
+    }
+    if session
+        .expected_length
+        .is_some_and(|expected| session.received != expected)
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_UPLOAD_LENGTH"));
+    }
+
+    session.finalized = true;
+    let project_id = session.project_id.clone();
+    let session_bucket = session.bucket.clone();
+    let name = session.name.clone();
+    let content_type = session.content_type.clone();
+    let data = std::mem::take(&mut session.data);
+    drop(sessions);
+    let metadata = upload_object(
+        state,
+        &project_id,
+        &session_bucket,
+        ParsedUpload {
+            name,
+            content_type,
+            data: Bytes::from(data),
+        },
+    )?;
+    let mut response_headers = HeaderMap::new();
+    insert_header(&mut response_headers, "x-goog-upload-status", "final")?;
+    Ok((StatusCode::OK, response_headers, metadata).into_response())
+}
+
+fn insert_header(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<(), StorageError> {
+    headers.insert(
+        name,
+        HeaderValue::from_str(value)
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INVALID_UPLOAD_HEADER"))?,
+    );
+    Ok(())
 }
 
 fn is_resumable_status_query(headers: &HeaderMap, body: &Bytes) -> bool {

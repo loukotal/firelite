@@ -11,6 +11,7 @@ import {
   isSignInWithEmailLink,
   sendSignInLinkToEmail,
   signInWithCustomToken,
+  signInAnonymously,
   signInWithEmailAndPassword,
   signInWithEmailLink,
   signOut
@@ -49,6 +50,7 @@ try {
   connectAuthEmulator(auth, baseUrl, { disableWarnings: true });
 
   await testPasswordFlow(auth);
+  await testAnonymousFlow(auth);
   await testCustomTokenFlow(auth);
   await testEmailLinkFlow(auth, baseUrl);
 
@@ -56,6 +58,19 @@ try {
   console.log("firebase/auth SDK E2E passed");
 } finally {
   daemon.kill("SIGTERM");
+}
+
+async function testAnonymousFlow(auth) {
+  await signOut(auth);
+  const credential = await signInAnonymously(auth);
+  assert.equal(credential.user.isAnonymous, true);
+  assert.equal(credential.user.email, null);
+  assert.equal(credential.user.providerData.length, 0);
+  const tokenResult = await credential.user.getIdTokenResult();
+  assert.equal(tokenResult.signInProvider, "anonymous");
+  await credential.user.reload();
+  const repeated = await signInAnonymously(auth);
+  assert.equal(repeated.user.uid, credential.user.uid);
 }
 
 async function testPasswordFlow(auth) {

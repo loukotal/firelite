@@ -118,8 +118,8 @@ struct OobCodeRecord {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SignUpRequest {
-    email: String,
-    password: String,
+    email: Option<String>,
+    password: Option<String>,
     return_secure_token: Option<bool>,
 }
 
@@ -257,7 +257,8 @@ struct AdminBatchGetQuery {
 struct AuthResponse {
     kind: &'static str,
     local_id: String,
-    email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
     id_token: String,
     refresh_token: String,
     expires_in: String,
@@ -315,7 +316,8 @@ struct ListAccountsResponse {
 #[serde(rename_all = "camelCase")]
 struct EmulatorUser {
     local_id: String,
-    email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -326,7 +328,8 @@ struct EmulatorUser {
     custom_attributes: Option<String>,
     disabled: bool,
     email_verified: bool,
-    password_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password_hash: Option<String>,
     valid_since: String,
     created_at: String,
     last_login_at: String,
@@ -546,14 +549,18 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
     let project_id = default_project_id();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.to_string()).or_default();
-    let email = normalize_email(&payload.email);
+    let (email, password) = match (payload.email, payload.password) {
+        (Some(email), Some(password)) => (normalize_email(&email), Some(password)),
+        (None, None) => (String::new(), None),
+        _ => return Err(error(StatusCode::BAD_REQUEST, "MISSING_EMAIL_OR_PASSWORD")),
+    };
     let email_key = email.clone();
 
-    if project.user_ids_by_email.contains_key(&email_key) {
+    if !email.is_empty() && project.user_ids_by_email.contains_key(&email_key) {
         return Err(error(StatusCode::BAD_REQUEST, "EMAIL_EXISTS"));
     }
 
-    if payload.password.len() < 6 {
+    if password.as_ref().is_some_and(|password| password.len() < 6) {
         return Err(error(StatusCode::BAD_REQUEST, "WEAK_PASSWORD"));
     }
 
@@ -568,21 +575,27 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
         custom_attributes: None,
         disabled: false,
         email_verified: false,
-        password_hash: Some(hash_password(&payload.password)),
+        password_hash: password.as_deref().map(hash_password),
         valid_since_secs: now / 1000,
         mfa_info: Vec::new(),
-        providers: vec![ProviderRecord {
-            provider_id: "password".to_string(),
-            raw_id: local_id,
-            email,
-        }],
+        providers: password
+            .map(|_| {
+                vec![ProviderRecord {
+                    provider_id: "password".to_string(),
+                    raw_id: local_id,
+                    email,
+                }]
+            })
+            .unwrap_or_default(),
         created_at_ms: now,
         last_login_at_ms: None,
     };
 
-    project
-        .user_ids_by_email
-        .insert(email_key, record.local_id.clone());
+    if !email_key.is_empty() {
+        project
+            .user_ids_by_email
+            .insert(email_key, record.local_id.clone());
+    }
     project
         .users_by_id
         .insert(record.local_id.clone(), record.clone());
@@ -1149,9 +1162,11 @@ fn delete_account(auth: &AuthState, project_id: &str, local_id: &str) -> Result<
     let Some(record) = project.users_by_id.remove(local_id) else {
         return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
     };
-    project
-        .user_ids_by_email
-        .remove(&normalize_email(&record.email));
+    if !record.email.is_empty() {
+        project
+            .user_ids_by_email
+            .remove(&normalize_email(&record.email));
+    }
     if let Some(phone_number) = record.phone_number {
         project.user_ids_by_phone.remove(&phone_number);
     }
@@ -1342,7 +1357,7 @@ fn auth_response(
     AuthResponse {
         kind: "identitytoolkit#SignupNewUserResponse",
         local_id: record.local_id.clone(),
-        email: record.email.clone(),
+        email: (!record.email.is_empty()).then(|| record.email.clone()),
         id_token: if include_token {
             make_token(project_id, record)
         } else {
@@ -1393,23 +1408,33 @@ fn parse_refresh_token(token: &str) -> Result<(String, String, u64), AuthError> 
 fn make_token(project_id: &str, record: &UserRecord) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
     let issued_at = now_secs();
+    let sign_in_provider = record
+        .providers
+        .first()
+        .map(|provider| provider.provider_id.as_str())
+        .unwrap_or("anonymous");
     let mut payload = serde_json::json!({
         "aud": project_id,
         "iss": format!("https://securetoken.google.com/{project_id}"),
         "sub": record.local_id,
         "user_id": record.local_id,
-        "email": record.email,
-        "email_verified": record.email_verified,
         "iat": issued_at,
         "auth_time": issued_at,
         "exp": issued_at + 3600,
         "firebase": {
-            "sign_in_provider": "password",
-            "identities": {
-                "email": [record.email]
-            }
+            "sign_in_provider": sign_in_provider,
+            "identities": {}
         },
     });
+    if !record.email.is_empty() {
+        let object = payload.as_object_mut().expect("token payload is an object");
+        object.insert("email".to_string(), serde_json::json!(record.email));
+        object.insert(
+            "email_verified".to_string(),
+            serde_json::json!(record.email_verified),
+        );
+        payload["firebase"]["identities"]["email"] = serde_json::json!([record.email]);
+    }
     if let Some(phone_number) = &record.phone_number {
         let object = payload.as_object_mut().expect("token payload is an object");
         object.insert("phone_number".to_string(), serde_json::json!(phone_number));
@@ -1580,14 +1605,14 @@ impl From<&UserRecord> for EmulatorUser {
     fn from(record: &UserRecord) -> Self {
         Self {
             local_id: record.local_id.clone(),
-            email: record.email.clone(),
+            email: (!record.email.is_empty()).then(|| record.email.clone()),
             display_name: record.display_name.clone(),
             photo_url: record.photo_url.clone(),
             phone_number: record.phone_number.clone(),
             custom_attributes: record.custom_attributes.clone(),
             disabled: record.disabled,
             email_verified: record.email_verified,
-            password_hash: record.password_hash.clone().unwrap_or_default(),
+            password_hash: record.password_hash.clone(),
             valid_since: record.valid_since_secs.to_string(),
             created_at: record.created_at_ms.to_string(),
             last_login_at: record

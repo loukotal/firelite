@@ -85,19 +85,23 @@ cd "${REPO_ROOT}"
 
 CURRENT_BRANCH="$(git branch --show-current)"
 [[ "${CURRENT_BRANCH}" == "main" ]] || die "release must run from main, currently on ${CURRENT_BRANCH}"
+if [[ -z "${RELEASE_REMOTE:-}" ]]; then
+  RELEASE_REMOTE="$(git config --get "branch.${CURRENT_BRANCH}.remote" || true)"
+fi
+[[ -n "${RELEASE_REMOTE}" ]] || die "main has no configured tracking remote"
 
 git diff --quiet || die "working tree has unstaged changes"
 git diff --cached --quiet || die "working tree has staged changes"
 
-run git fetch origin --tags
+run git fetch "${RELEASE_REMOTE}" --tags
 LOCAL_HEAD="$(git rev-parse HEAD)"
-REMOTE_HEAD="$(git rev-parse origin/main)"
-[[ "${LOCAL_HEAD}" == "${REMOTE_HEAD}" ]] || die "main is not aligned with origin/main"
+REMOTE_HEAD="$(git rev-parse "${RELEASE_REMOTE}/main")"
+[[ "${LOCAL_HEAD}" == "${REMOTE_HEAD}" ]] || die "main is not aligned with ${RELEASE_REMOTE}/main"
 
 if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   die "local tag ${TAG} already exists"
 fi
-if git ls-remote --exit-code --tags origin "${TAG}" >/dev/null 2>&1; then
+if git ls-remote --exit-code --tags "${RELEASE_REMOTE}" "${TAG}" >/dev/null 2>&1; then
   die "remote tag ${TAG} already exists"
 fi
 
@@ -137,7 +141,7 @@ fi
 run git add Cargo.lock crates/firelite/Cargo.toml
 run git commit -m "Release ${VERSION}"
 run git tag "${TAG}"
-run git push origin main "${TAG}"
+run git push "${RELEASE_REMOTE}" main "${TAG}"
 run gh release create "${TAG}" --repo loukotal/firelite --title "${TAG}" --notes "Firelite ${VERSION}"
 
 printf '\nRelease created: https://github.com/loukotal/firelite/releases/tag/%s\n' "${TAG}"

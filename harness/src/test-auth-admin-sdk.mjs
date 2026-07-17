@@ -92,7 +92,11 @@ try {
     (error) => error.code === "auth/phone-number-already-exists"
   );
 
-  await auth.updateUser(uid, { disabled: false });
+  const mfaCleared = await auth.updateUser(uid, {
+    disabled: false,
+    multiFactor: { enrolledFactors: [] }
+  });
+  assert.equal(mfaCleared.multiFactor, undefined);
   const signIn = await fetch(
     `${baseUrl}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake`,
     {

@@ -9,6 +9,7 @@ import {
   createUserWithEmailAndPassword,
   getAuth,
   isSignInWithEmailLink,
+  getMultiFactorResolver,
   sendSignInLinkToEmail,
   signInWithCustomToken,
   signInAnonymously,
@@ -51,6 +52,7 @@ try {
 
   await testPasswordFlow(auth);
   await testAnonymousFlow(auth);
+  await testPhoneMfaFlow(auth, baseUrl);
   await testCustomTokenFlow(auth);
   await testEmailLinkFlow(auth, baseUrl);
 
@@ -71,6 +73,83 @@ async function testAnonymousFlow(auth) {
   await credential.user.reload();
   const repeated = await signInAnonymously(auth);
   assert.equal(repeated.user.uid, credential.user.uid);
+}
+
+async function testPhoneMfaFlow(auth, baseUrl) {
+  await signOut(auth);
+  const email = `sdk-mfa-${Date.now()}@example.test`;
+  const password = "secret123";
+  const created = await createUserWithEmailAndPassword(auth, email, password);
+  const idToken = await created.user.getIdToken();
+  const enrollment = await postJson(
+    `${baseUrl}/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:start?key=fake`,
+    {
+      idToken,
+      phoneEnrollmentInfo: {
+        phoneNumber: "+15555550123",
+        clientType: "CLIENT_TYPE_WEB"
+      }
+    }
+  );
+  const enrollmentCodes = await fetchJson(
+    `${baseUrl}/emulator/v1/projects/demo-firelite/verificationCodes`
+  );
+  await postJson(
+    `${baseUrl}/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:finalize?key=fake`,
+    {
+      idToken,
+      displayName: "SDK phone",
+      phoneVerificationInfo: {
+        sessionInfo: enrollment.phoneSessionInfo.sessionInfo,
+        code: enrollmentCodes.verificationCodes[0].code
+      }
+    }
+  );
+
+  await signOut(auth);
+  let mfaError;
+  try {
+    await signInWithEmailAndPassword(auth, email, password);
+    assert.fail("MFA user signed in without a second factor");
+  } catch (error) {
+    assert.equal(error.code, "auth/multi-factor-auth-required");
+    mfaError = error;
+  }
+
+  const resolver = getMultiFactorResolver(auth, mfaError);
+  assert.equal(resolver.hints.length, 1);
+  assert.equal(resolver.hints[0].factorId, "phone");
+  assert.equal(resolver.hints[0].phoneNumber, "+15555550123");
+  assert.equal(resolver.hints[0].displayName, "SDK phone");
+
+  const firstFactor = await postJson(
+    `${baseUrl}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake`,
+    { email, password, returnSecureToken: true }
+  );
+  const signIn = await postJson(
+    `${baseUrl}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:start?key=fake`,
+    {
+      mfaPendingCredential: firstFactor.mfaPendingCredential,
+      mfaEnrollmentId: resolver.hints[0].uid,
+      phoneSignInInfo: {}
+    }
+  );
+  const verificationId = signIn.phoneResponseInfo.sessionInfo;
+  const signInCodes = await fetchJson(
+    `${baseUrl}/emulator/v1/projects/demo-firelite/verificationCodes`
+  );
+  const code = signInCodes.verificationCodes.find(
+    (entry) => entry.sessionInfo === verificationId
+  ).code;
+  const signedIn = await postJson(
+    `${baseUrl}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:finalize?key=fake`,
+    {
+      mfaPendingCredential: firstFactor.mfaPendingCredential,
+      phoneVerificationInfo: { sessionInfo: verificationId, code }
+    }
+  );
+  assert.ok(signedIn.idToken);
+  assert.ok(signedIn.refreshToken);
 }
 
 async function testPasswordFlow(auth) {
@@ -160,6 +239,18 @@ async function getFreePort() {
 async function fetchJson(url) {
   const response = await fetch(url);
   assert.equal(response.ok, true, `${url} returned ${response.status}`);
+  return await response.json();
+}
+
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    throw new Error(`${url} returned ${response.status}: ${await response.text()}`);
+  }
   return await response.json();
 }
 

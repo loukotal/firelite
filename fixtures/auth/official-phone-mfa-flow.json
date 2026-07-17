@@ -1,0 +1,137 @@
+{
+  "source": "firebase-tools-13.35.1-auth-emulator-contract",
+  "capturedAt": "2026-07-17T00:00:00.000Z",
+  "service": "auth",
+  "projectId": "demo-firelite",
+  "steps": [
+    {
+      "name": "start-phone-enrollment",
+      "request": {
+        "method": "POST",
+        "path": "/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:start?key=fake",
+        "body": {
+          "idToken": "<id-token>",
+          "phoneEnrollmentInfo": {
+            "phoneNumber": "+15555550123",
+            "clientType": "CLIENT_TYPE_WEB"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "bodyShape": {
+          "phoneSessionInfo": {
+            "sessionInfo": "<session-info>"
+          }
+        }
+      }
+    },
+    {
+      "name": "inspect-enrollment-code",
+      "request": {
+        "method": "GET",
+        "path": "/emulator/v1/projects/demo-firelite/verificationCodes"
+      },
+      "response": {
+        "status": 200,
+        "bodyShape": {
+          "verificationCodes": [
+            {
+              "phoneNumber": "+15555550123",
+              "sessionInfo": "<session-info>",
+              "code": "<six-digit-code>"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "finalize-phone-enrollment",
+      "request": {
+        "method": "POST",
+        "path": "/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:finalize?key=fake",
+        "body": {
+          "idToken": "<id-token>",
+          "displayName": "Personal phone",
+          "phoneVerificationInfo": {
+            "sessionInfo": "<session-info>",
+            "code": "<six-digit-code>"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "bodyShape": {
+          "idToken": "<updated-id-token>",
+          "refreshToken": "<updated-refresh-token>"
+        }
+      }
+    },
+    {
+      "name": "password-first-factor",
+      "request": {
+        "method": "POST",
+        "path": "/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+      },
+      "response": {
+        "status": 200,
+        "bodyShape": {
+          "kind": "identitytoolkit#VerifyPasswordResponse",
+          "localId": "<uid>",
+          "email": "mfa@example.test",
+          "registered": true,
+          "mfaPendingCredential": "<pending-credential>",
+          "mfaInfo": [
+            {
+              "mfaEnrollmentId": "<factor-id>",
+              "displayName": "Personal phone",
+              "enrolledAt": "<rfc3339-time>",
+              "phoneInfo": "+15555550123"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "start-phone-mfa-sign-in",
+      "request": {
+        "method": "POST",
+        "path": "/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:start?key=fake",
+        "body": {
+          "mfaPendingCredential": "<pending-credential>",
+          "mfaEnrollmentId": "<factor-id>",
+          "phoneSignInInfo": {}
+        }
+      },
+      "response": {
+        "status": 200,
+        "bodyShape": {
+          "phoneResponseInfo": {
+            "sessionInfo": "<session-info>"
+          }
+        }
+      }
+    },
+    {
+      "name": "finalize-phone-mfa-sign-in",
+      "request": {
+        "method": "POST",
+        "path": "/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:finalize?key=fake",
+        "body": {
+          "mfaPendingCredential": "<pending-credential>",
+          "phoneVerificationInfo": {
+            "sessionInfo": "<session-info>",
+            "code": "<six-digit-code>"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "bodyShape": {
+          "idToken": "<mfa-id-token>",
+          "refreshToken": "<mfa-refresh-token>"
+        }
+      }
+    }
+  ]
+}

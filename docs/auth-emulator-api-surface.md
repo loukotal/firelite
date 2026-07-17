@@ -25,6 +25,8 @@ This tracks the `firebase/auth` client APIs currently used by the app and the em
 | `sendSignInLinkToEmail` | `accounts:sendOobCode` with `EMAIL_SIGNIN` | implemented | Returns `oobCode` directly and exposes `/emulator/v1/projects/{project}/oobCodes` for local inspection. |
 | `signInWithPopup` | IdP sign-in flow via `accounts:signInWithIdp` | implemented | Supports provider ID, raw ID, and email from `postBody`; popup UI behavior still needs SDK/browser discovery. |
 | `signInWithCustomToken` | `accounts:signInWithCustomToken` | implemented | Accepts unsigned local JWT-like tokens or plain local IDs for tests. |
+| `multiFactor` phone enrollment | v2 `accounts/mfaEnrollment:start` and `accounts/mfaEnrollment:finalize` | implemented | Uses inspectable, single-use emulator SMS codes and persists factors in `mfaInfo`. |
+| `getMultiFactorResolver` phone sign-in | Password first factor plus v2 `accounts/mfaSignIn:start` and `accounts/mfaSignIn:finalize` | implemented | Password login returns `mfaPendingCredential`; completed and refreshed tokens retain phone second-factor claims. |
 
 ## Implementation notes
 

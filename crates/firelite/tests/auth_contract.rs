@@ -166,6 +166,398 @@ async fn auth_anonymous_signup_lookup_refresh_and_delete_flow() {
 }
 
 #[tokio::test]
+async fn auth_phone_mfa_enrollment_and_sign_in_flow() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+    let email = "phone-mfa@example.test";
+    let password = "secret123";
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake"
+        ))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let enrollment_started: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:start?key=fake"
+        ))
+        .json(&json!({
+            "idToken": created["idToken"],
+            "phoneEnrollmentInfo": {
+                "phoneNumber": "+15555550123",
+                "clientType": "CLIENT_TYPE_WEB"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let enrollment_session = enrollment_started["phoneSessionInfo"]["sessionInfo"]
+        .as_str()
+        .unwrap();
+    let enrollment_codes: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        enrollment_codes["verificationCodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        enrollment_codes["verificationCodes"][0]["sessionInfo"],
+        enrollment_session
+    );
+    assert_eq!(
+        enrollment_codes["verificationCodes"][0]["phoneNumber"],
+        "+15555550123"
+    );
+    let enrollment_code = enrollment_codes["verificationCodes"][0]["code"]
+        .as_str()
+        .unwrap();
+
+    let enrolled: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:finalize?key=fake"
+        ))
+        .json(&json!({
+            "idToken": created["idToken"],
+            "displayName": "Personal phone",
+            "phoneVerificationInfo": {
+                "sessionInfo": enrollment_session,
+                "code": enrollment_code
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(enrolled["idToken"].as_str().unwrap().contains('.'));
+    assert!(enrolled["refreshToken"]
+        .as_str()
+        .unwrap()
+        .starts_with("firelite-refresh."));
+    let enrollment_id = enrolled["mfaInfo"][0]["mfaEnrollmentId"].as_str().unwrap();
+
+    let lookup: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=fake"
+        ))
+        .json(&json!({ "idToken": enrolled["idToken"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup["users"][0]["mfaInfo"][0]["mfaEnrollmentId"],
+        enrollment_id
+    );
+    assert_eq!(
+        lookup["users"][0]["mfaInfo"][0]["phoneInfo"],
+        "+15555550123"
+    );
+
+    let first_factor: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(first_factor.get("idToken").is_none());
+    assert!(first_factor.get("refreshToken").is_none());
+    assert_eq!(first_factor["mfaInfo"][0]["mfaEnrollmentId"], enrollment_id);
+    let pending = first_factor["mfaPendingCredential"].as_str().unwrap();
+
+    let sign_in_started: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:start?key=fake"
+        ))
+        .json(&json!({
+            "mfaPendingCredential": pending,
+            "mfaEnrollmentId": enrollment_id,
+            "phoneSignInInfo": {}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sign_in_session = sign_in_started["phoneResponseInfo"]["sessionInfo"]
+        .as_str()
+        .unwrap();
+    let sign_in_codes: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        sign_in_codes["verificationCodes"].as_array().unwrap().len(),
+        1
+    );
+    let sign_in_code = sign_in_codes["verificationCodes"][0]["code"]
+        .as_str()
+        .unwrap();
+
+    let wrong_code = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:finalize?key=fake"
+        ))
+        .json(&json!({
+            "mfaPendingCredential": pending,
+            "phoneVerificationInfo": {
+                "sessionInfo": sign_in_session,
+                "code": "000000"
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_code.status(), StatusCode::BAD_REQUEST);
+
+    let signed_in: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:finalize?key=fake"
+        ))
+        .json(&json!({
+            "mfaPendingCredential": pending,
+            "phoneVerificationInfo": {
+                "sessionInfo": sign_in_session,
+                "code": sign_in_code
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let claims = decode_jwt_payload(signed_in["idToken"].as_str().unwrap());
+    assert_eq!(claims["firebase"]["sign_in_provider"], "password");
+    assert_eq!(claims["firebase"]["sign_in_second_factor"], "phone");
+    assert_eq!(
+        claims["firebase"]["second_factor_identifier"],
+        enrollment_id
+    );
+
+    let refreshed: Value = client
+        .post(format!(
+            "{base_url}/securetoken.googleapis.com/v1/token?key=fake"
+        ))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", signed_in["refreshToken"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let refreshed_claims = decode_jwt_payload(refreshed["id_token"].as_str().unwrap());
+    assert_eq!(
+        refreshed_claims["firebase"]["sign_in_second_factor"],
+        "phone"
+    );
+
+    let replay = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:start?key=fake"
+        ))
+        .json(&json!({
+            "mfaPendingCredential": pending,
+            "mfaEnrollmentId": enrollment_id,
+            "phoneSignInInfo": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+
+    let blocked_first_factor: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": email,
+            "password": password,
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let blocked_pending = blocked_first_factor["mfaPendingCredential"]
+        .as_str()
+        .unwrap();
+    let blocked_start: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:start?key=fake"
+        ))
+        .json(&json!({
+            "mfaPendingCredential": blocked_pending,
+            "mfaEnrollmentId": enrollment_id,
+            "phoneSignInInfo": {}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let blocked_session = blocked_start["phoneResponseInfo"]["sessionInfo"]
+        .as_str()
+        .unwrap();
+    let blocked_codes: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let blocked_code = blocked_codes["verificationCodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["sessionInfo"] == blocked_session)
+        .unwrap()["code"]
+        .as_str()
+        .unwrap();
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "localId": created["localId"],
+            "disableUser": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let blocked_finalize: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaSignIn:finalize?key=fake"
+        ))
+        .json(&json!({
+            "mfaPendingCredential": blocked_pending,
+            "phoneVerificationInfo": {
+                "sessionInfo": blocked_session,
+                "code": blocked_code
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(blocked_finalize["error"]["message"], "USER_DISABLED");
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:delete?key=fake"
+        ))
+        .json(&json!({ "localId": created["localId"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let codes_after_delete: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        codes_after_delete["verificationCodes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn auth_secure_token_refresh_supports_browser_sdk_cors_flow() {
     let base_url = spawn_app().await;
     let client = reqwest::Client::new();

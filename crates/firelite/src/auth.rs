@@ -34,6 +34,10 @@ pub fn router() -> Router<SharedState> {
                 .options(preflight),
         )
         .route(
+            "/identitytoolkit.googleapis.com/v2/*action",
+            post(identity_v2_action).options(preflight),
+        )
+        .route(
             "/emulator/v1/projects/:project_id/accounts",
             get(list_accounts).delete(reset_project_accounts),
         )
@@ -44,6 +48,10 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/emulator/v1/projects/:project_id/oobCodes",
             get(list_oob_codes),
+        )
+        .route(
+            "/emulator/v1/projects/:project_id/verificationCodes",
+            get(list_verification_codes),
         )
         .route("/emulator/action", get(oob_action))
 }
@@ -60,6 +68,8 @@ struct ProjectAuthState {
     user_ids_by_phone: HashMap<String, String>,
     user_ids_by_provider: HashMap<(String, String), String>,
     oob_codes: HashMap<String, OobCodeRecord>,
+    verification_codes: HashMap<String, VerificationCodeRecord>,
+    mfa_pending_credentials: HashMap<String, MfaPendingCredential>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +125,31 @@ struct OobCodeRecord {
     created_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct VerificationCodeRecord {
+    phone_number: String,
+    code: String,
+    purpose: VerificationPurpose,
+}
+
+#[derive(Debug, Clone)]
+enum VerificationPurpose {
+    Enrollment {
+        local_id: String,
+    },
+    SignIn {
+        local_id: String,
+        mfa_pending_credential: String,
+        mfa_enrollment_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct MfaPendingCredential {
+    local_id: String,
+    issued_at: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SignUpRequest {
@@ -129,6 +164,49 @@ struct SignInRequest {
     email: String,
     password: String,
     return_secure_token: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MfaEnrollmentStartRequest {
+    id_token: String,
+    phone_enrollment_info: PhoneEnrollmentInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PhoneEnrollmentInfo {
+    phone_number: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MfaEnrollmentFinalizeRequest {
+    id_token: String,
+    display_name: Option<String>,
+    phone_verification_info: PhoneVerificationInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PhoneVerificationInfo {
+    session_info: String,
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MfaSignInStartRequest {
+    mfa_pending_credential: String,
+    mfa_enrollment_id: String,
+    phone_sign_in_info: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MfaSignInFinalizeRequest {
+    mfa_pending_credential: String,
+    phone_verification_info: PhoneVerificationInfo,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +370,20 @@ struct ListOobCodesResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ListVerificationCodesResponse {
+    verification_codes: Vec<EmulatorVerificationCode>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmulatorVerificationCode {
+    phone_number: String,
+    session_info: String,
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct EmulatorOobCode {
     email: String,
     oob_code: String,
@@ -391,7 +483,9 @@ async fn refresh_secure_token(
     if payload.grant_type != "refresh_token" {
         return Err(error(StatusCode::BAD_REQUEST, "UNSUPPORTED_GRANT_TYPE"));
     }
-    let (project_id, local_id, issued_at) = parse_refresh_token(&payload.refresh_token)?;
+    let refresh = parse_refresh_token(&payload.refresh_token)?;
+    let project_id = refresh.project_id;
+    let local_id = refresh.local_id;
     let projects = state.auth.projects.read().expect("auth state poisoned");
     let record = projects
         .get(&project_id)
@@ -400,15 +494,19 @@ async fn refresh_secure_token(
     if record.disabled {
         return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
     }
-    if issued_at < record.valid_since_secs {
+    if refresh.issued_at < record.valid_since_secs {
         return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
     }
-    let id_token = make_token(&project_id, record);
+    let second_factor = refresh
+        .second_factor
+        .as_deref()
+        .zip(refresh.second_factor_identifier.as_deref());
+    let id_token = make_token_with_second_factor(&project_id, record, second_factor);
     Ok(Json(SecureTokenResponse {
         access_token: id_token.clone(),
         expires_in: "3600".to_string(),
         token_type: "Bearer",
-        refresh_token: make_refresh_token(&project_id, &local_id),
+        refresh_token: make_refresh_token_with_second_factor(&project_id, &local_id, second_factor),
         id_token,
         user_id: local_id,
         project_id,
@@ -429,7 +527,7 @@ async fn identity_action(
         }
         "accounts:signInWithPassword" => {
             let payload = parse_payload(payload)?;
-            serde_json::to_value(sign_in_with_password(&state, payload)?)
+            Ok(sign_in_with_password(&state, payload)?)
         }
         "accounts:lookup" => {
             let payload = parse_payload(payload)?;
@@ -505,6 +603,33 @@ async fn identity_action(
     }
     .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"))?;
 
+    Ok(Json(body))
+}
+
+async fn identity_v2_action(
+    State(state): State<SharedState>,
+    Path(action): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> AuthResult<serde_json::Value> {
+    let body = match action.as_str() {
+        "accounts/mfaEnrollment:start" => {
+            let payload = parse_payload(payload)?;
+            start_mfa_enrollment(&state, payload)?
+        }
+        "accounts/mfaEnrollment:finalize" => {
+            let payload = parse_payload(payload)?;
+            finalize_mfa_enrollment(&state, payload)?
+        }
+        "accounts/mfaSignIn:start" => {
+            let payload = parse_payload(payload)?;
+            start_mfa_sign_in(&state, payload)?
+        }
+        "accounts/mfaSignIn:finalize" => {
+            let payload = parse_payload(payload)?;
+            finalize_mfa_sign_in(&state, payload)?
+        }
+        _ => return Err(error(StatusCode::NOT_FOUND, "NOT_FOUND")),
+    };
     Ok(Json(body))
 }
 
@@ -746,7 +871,7 @@ fn admin_update_user(
 fn sign_in_with_password(
     state: &SharedState,
     payload: SignInRequest,
-) -> Result<AuthResponse, AuthError> {
+) -> Result<serde_json::Value, AuthError> {
     let project_id = project_id_for_email(&state.auth, &payload.email);
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.to_string()).or_default();
@@ -766,12 +891,269 @@ fn sign_in_with_password(
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_PASSWORD"));
     }
 
+    if !record.mfa_info.is_empty() {
+        let local_id = record.local_id.clone();
+        let email = record.email.clone();
+        let mfa_info = record.mfa_info.clone();
+        let pending_credential = format!("firelite-mfa-pending-{}", Uuid::new_v4());
+        project.mfa_pending_credentials.insert(
+            pending_credential.clone(),
+            MfaPendingCredential {
+                local_id: local_id.clone(),
+                issued_at: now_secs(),
+            },
+        );
+        return Ok(json!({
+            "kind": "identitytoolkit#VerifyPasswordResponse",
+            "localId": local_id,
+            "email": email,
+            "registered": true,
+            "mfaPendingCredential": pending_credential,
+            "mfaInfo": mfa_info,
+        }));
+    }
+
     record.last_login_at_ms = Some(now_ms());
-    Ok(auth_response(
+    serde_json::to_value(auth_response(
         &project_id,
         record,
         payload.return_secure_token,
     ))
+    .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"))
+}
+
+fn start_mfa_enrollment(
+    state: &SharedState,
+    payload: MfaEnrollmentStartRequest,
+) -> Result<serde_json::Value, AuthError> {
+    let claims = parse_token_claims(&payload.id_token)?;
+    if !is_valid_phone_number(&payload.phone_enrollment_info.phone_number) {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_PHONE_NUMBER"));
+    }
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects
+        .get_mut(&claims.project_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    let user = project
+        .users_by_id
+        .get(&claims.local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if user.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    if claims.issued_at < user.valid_since_secs {
+        return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+    }
+    if user.mfa_info.iter().any(|factor| {
+        factor.phone_info.as_deref() == Some(&payload.phone_enrollment_info.phone_number)
+    }) {
+        return Err(error(StatusCode::BAD_REQUEST, "SECOND_FACTOR_EXISTS"));
+    }
+
+    let session_info = create_verification_code(
+        project,
+        payload.phone_enrollment_info.phone_number,
+        VerificationPurpose::Enrollment {
+            local_id: claims.local_id,
+        },
+    );
+    Ok(json!({
+        "phoneSessionInfo": {
+            "sessionInfo": session_info,
+        }
+    }))
+}
+
+fn finalize_mfa_enrollment(
+    state: &SharedState,
+    payload: MfaEnrollmentFinalizeRequest,
+) -> Result<serde_json::Value, AuthError> {
+    let claims = parse_token_claims(&payload.id_token)?;
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects
+        .get_mut(&claims.project_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    let verification = project
+        .verification_codes
+        .get(&payload.phone_verification_info.session_info)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"))?;
+    let VerificationPurpose::Enrollment { local_id } = &verification.purpose else {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"));
+    };
+    if local_id != &claims.local_id {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"));
+    }
+    if verification.code != payload.phone_verification_info.code {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_CODE"));
+    }
+
+    let user = project
+        .users_by_id
+        .get_mut(&claims.local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if user.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    if claims.issued_at < user.valid_since_secs {
+        return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+    }
+    if user
+        .mfa_info
+        .iter()
+        .any(|factor| factor.phone_info.as_deref() == Some(verification.phone_number.as_str()))
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "SECOND_FACTOR_EXISTS"));
+    }
+    let enrollment = MfaEnrollment {
+        mfa_enrollment_id: Some(Uuid::new_v4().to_string()),
+        display_name: payload.display_name,
+        phone_info: Some(verification.phone_number),
+        unobfuscated_phone_info: None,
+        enrolled_at: Some(now_rfc3339()),
+    };
+    user.mfa_info.push(enrollment);
+    project
+        .verification_codes
+        .remove(&payload.phone_verification_info.session_info);
+
+    Ok(json!({
+        "idToken": make_token(&claims.project_id, user),
+        "refreshToken": make_refresh_token(&claims.project_id, &claims.local_id),
+        "localId": user.local_id,
+        "email": user.email,
+        "mfaInfo": user.mfa_info,
+    }))
+}
+
+fn start_mfa_sign_in(
+    state: &SharedState,
+    payload: MfaSignInStartRequest,
+) -> Result<serde_json::Value, AuthError> {
+    let _phone_sign_in_info = payload.phone_sign_in_info;
+    let project_id = project_id_for_mfa_pending(&state.auth, &payload.mfa_pending_credential)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_MFA_PENDING_CREDENTIAL"))?;
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects
+        .get_mut(&project_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_MFA_PENDING_CREDENTIAL"))?;
+    let pending = project
+        .mfa_pending_credentials
+        .get(&payload.mfa_pending_credential)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_MFA_PENDING_CREDENTIAL"))?;
+    let user = project
+        .users_by_id
+        .get(&pending.local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if user.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    if pending.issued_at < user.valid_since_secs {
+        return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+    }
+    let factor = user
+        .mfa_info
+        .iter()
+        .find(|factor| factor.mfa_enrollment_id.as_deref() == Some(&payload.mfa_enrollment_id))
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MFA_ENROLLMENT_NOT_FOUND"))?;
+    let phone_number = factor
+        .phone_info
+        .clone()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MFA_ENROLLMENT_NOT_FOUND"))?;
+    let session_info = create_verification_code(
+        project,
+        phone_number,
+        VerificationPurpose::SignIn {
+            local_id: pending.local_id,
+            mfa_pending_credential: payload.mfa_pending_credential,
+            mfa_enrollment_id: payload.mfa_enrollment_id,
+        },
+    );
+    Ok(json!({
+        "phoneResponseInfo": {
+            "sessionInfo": session_info,
+        }
+    }))
+}
+
+fn finalize_mfa_sign_in(
+    state: &SharedState,
+    payload: MfaSignInFinalizeRequest,
+) -> Result<serde_json::Value, AuthError> {
+    let project_id = project_id_for_mfa_pending(&state.auth, &payload.mfa_pending_credential)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_MFA_PENDING_CREDENTIAL"))?;
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects
+        .get_mut(&project_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_MFA_PENDING_CREDENTIAL"))?;
+    let verification = project
+        .verification_codes
+        .get(&payload.phone_verification_info.session_info)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"))?;
+    let VerificationPurpose::SignIn {
+        local_id,
+        mfa_pending_credential,
+        mfa_enrollment_id,
+    } = &verification.purpose
+    else {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"));
+    };
+    if mfa_pending_credential != &payload.mfa_pending_credential {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_MFA_PENDING_CREDENTIAL",
+        ));
+    }
+    if verification.code != payload.phone_verification_info.code {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_CODE"));
+    }
+    let pending = project
+        .mfa_pending_credentials
+        .get(&payload.mfa_pending_credential)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_MFA_PENDING_CREDENTIAL"))?;
+    if &pending.local_id != local_id {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_MFA_PENDING_CREDENTIAL",
+        ));
+    }
+    let user = project
+        .users_by_id
+        .get_mut(local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if user.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    if pending.issued_at < user.valid_since_secs {
+        return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+    }
+    if !user
+        .mfa_info
+        .iter()
+        .any(|factor| factor.mfa_enrollment_id.as_deref() == Some(mfa_enrollment_id))
+    {
+        return Err(error(StatusCode::BAD_REQUEST, "MFA_ENROLLMENT_NOT_FOUND"));
+    }
+    user.last_login_at_ms = Some(now_ms());
+    let second_factor = Some(("phone", mfa_enrollment_id.as_str()));
+    let id_token = make_token_with_second_factor(&project_id, user, second_factor);
+    let refresh_token = make_refresh_token_with_second_factor(&project_id, local_id, second_factor);
+    project
+        .verification_codes
+        .remove(&payload.phone_verification_info.session_info);
+    project
+        .mfa_pending_credentials
+        .remove(&payload.mfa_pending_credential);
+
+    Ok(json!({
+        "idToken": id_token,
+        "refreshToken": refresh_token,
+        "localId": local_id,
+        "email": user.email,
+        "mfaInfo": user.mfa_info,
+    }))
 }
 
 fn admin_lookup(
@@ -1154,6 +1536,28 @@ async fn list_oob_codes(
     Ok(Json(ListOobCodesResponse { oob_codes }))
 }
 
+async fn list_verification_codes(
+    State(state): State<SharedState>,
+    Path(project_id): Path<String>,
+) -> AuthResult<ListVerificationCodesResponse> {
+    let projects = state.auth.projects.read().expect("auth state poisoned");
+    let verification_codes = projects
+        .get(&project_id)
+        .map(|project| {
+            project
+                .verification_codes
+                .iter()
+                .map(|(session_info, record)| EmulatorVerificationCode {
+                    phone_number: record.phone_number.clone(),
+                    session_info: session_info.clone(),
+                    code: record.code.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(ListVerificationCodesResponse { verification_codes }))
+}
+
 fn delete_account(auth: &AuthState, project_id: &str, local_id: &str) -> Result<(), AuthError> {
     let mut projects = auth.projects.write().expect("auth state poisoned");
     let Some(project) = projects.get_mut(project_id) else {
@@ -1175,6 +1579,20 @@ fn delete_account(auth: &AuthState, project_id: &str, local_id: &str) -> Result<
             .user_ids_by_provider
             .remove(&(provider.provider_id, provider.raw_id));
     }
+    project
+        .mfa_pending_credentials
+        .retain(|_, pending| pending.local_id != local_id);
+    project
+        .verification_codes
+        .retain(|_, verification| match &verification.purpose {
+            VerificationPurpose::Enrollment {
+                local_id: verification_user,
+            }
+            | VerificationPurpose::SignIn {
+                local_id: verification_user,
+                ..
+            } => verification_user != local_id,
+        });
     Ok(())
 }
 
@@ -1373,15 +1791,37 @@ fn auth_response(
 }
 
 fn make_refresh_token(project_id: &str, local_id: &str) -> String {
-    let payload = URL_SAFE_NO_PAD.encode(format!(
-        r#"{{"project_id":"{project_id}","local_id":"{local_id}","iat":{},"nonce":"{}"}}"#,
-        now_secs(),
-        Uuid::new_v4()
-    ));
+    make_refresh_token_with_second_factor(project_id, local_id, None)
+}
+
+fn make_refresh_token_with_second_factor(
+    project_id: &str,
+    local_id: &str,
+    second_factor: Option<(&str, &str)>,
+) -> String {
+    let mut value = json!({
+        "project_id": project_id,
+        "local_id": local_id,
+        "iat": now_secs(),
+        "nonce": Uuid::new_v4(),
+    });
+    if let Some((factor, identifier)) = second_factor {
+        value["second_factor"] = json!(factor);
+        value["second_factor_identifier"] = json!(identifier);
+    }
+    let payload = URL_SAFE_NO_PAD.encode(value.to_string());
     format!("firelite-refresh.{payload}")
 }
 
-fn parse_refresh_token(token: &str) -> Result<(String, String, u64), AuthError> {
+struct RefreshTokenClaims {
+    project_id: String,
+    local_id: String,
+    issued_at: u64,
+    second_factor: Option<String>,
+    second_factor_identifier: Option<String>,
+}
+
+fn parse_refresh_token(token: &str) -> Result<RefreshTokenClaims, AuthError> {
     let Some(payload) = token.strip_prefix("firelite-refresh.") else {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"));
     };
@@ -1402,10 +1842,30 @@ fn parse_refresh_token(token: &str) -> Result<(String, String, u64), AuthError> 
         .get("iat")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    Ok((project_id.to_string(), local_id.to_string(), issued_at))
+    Ok(RefreshTokenClaims {
+        project_id: project_id.to_string(),
+        local_id: local_id.to_string(),
+        issued_at,
+        second_factor: value
+            .get("second_factor")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        second_factor_identifier: value
+            .get("second_factor_identifier")
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+    })
 }
 
 fn make_token(project_id: &str, record: &UserRecord) -> String {
+    make_token_with_second_factor(project_id, record, None)
+}
+
+fn make_token_with_second_factor(
+    project_id: &str,
+    record: &UserRecord,
+    second_factor: Option<(&str, &str)>,
+) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
     let issued_at = now_secs();
     let sign_in_provider = record
@@ -1449,6 +1909,10 @@ fn make_token(project_id: &str, record: &UserRecord) -> String {
                 identities.insert("phone".to_string(), serde_json::json!([phone_number]));
             }
         }
+    }
+    if let Some((factor, identifier)) = second_factor {
+        payload["firebase"]["sign_in_second_factor"] = json!(factor);
+        payload["firebase"]["second_factor_identifier"] = json!(identifier);
     }
     if let Some(custom_attributes) = &record.custom_attributes {
         if let Ok(serde_json::Value::Object(claims)) =
@@ -1556,7 +2020,7 @@ fn normalize_mfa_enrollments(enrollments: Vec<MfaEnrollment>) -> Vec<MfaEnrollme
                 enrollment.mfa_enrollment_id = Some(Uuid::new_v4().to_string());
             }
             if enrollment.enrolled_at.is_none() {
-                enrollment.enrolled_at = Some("1970-01-01T00:00:00.000Z".to_string());
+                enrollment.enrolled_at = Some(now_rfc3339());
             }
             if enrollment.unobfuscated_phone_info.is_none() {
                 enrollment.unobfuscated_phone_info = enrollment.phone_info.clone();
@@ -1575,6 +2039,58 @@ fn now_ms() -> u64 {
 
 fn now_secs() -> u64 {
     now_ms() / 1000
+}
+
+fn now_rfc3339() -> String {
+    format_timestamp_ms(now_ms())
+}
+
+fn format_timestamp_ms(timestamp_ms: u64) -> String {
+    let seconds = timestamp_ms / 1000;
+    let milliseconds = timestamp_ms % 1000;
+    let days = (seconds / 86_400) as i64;
+    let seconds_in_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let second = seconds_in_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
+    let days = days_since_epoch + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u64, day as u64)
+}
+
+fn create_verification_code(
+    project: &mut ProjectAuthState,
+    phone_number: String,
+    purpose: VerificationPurpose,
+) -> String {
+    let session_info = format!("firelite-sms-session-{}", Uuid::new_v4());
+    let mut hasher = Sha256::new();
+    hasher.update(session_info.as_bytes());
+    let digest = hasher.finalize();
+    let number = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    project.verification_codes.insert(
+        session_info.clone(),
+        VerificationCodeRecord {
+            phone_number,
+            code: format!("{number:06}"),
+            purpose,
+        },
+    );
+    session_info
 }
 
 fn error(status: StatusCode, message: &'static str) -> AuthError {
@@ -1599,6 +2115,16 @@ fn project_id_for_email(auth: &AuthState, email: &str) -> String {
                 .then(|| project_id.clone())
         })
         .unwrap_or_else(default_project_id)
+}
+
+fn project_id_for_mfa_pending(auth: &AuthState, credential: &str) -> Option<String> {
+    let projects = auth.projects.read().expect("auth state poisoned");
+    projects.iter().find_map(|(project_id, project)| {
+        project
+            .mfa_pending_credentials
+            .contains_key(credential)
+            .then(|| project_id.clone())
+    })
 }
 
 impl From<&UserRecord> for EmulatorUser {

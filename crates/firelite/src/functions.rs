@@ -43,6 +43,11 @@ pub struct PreparedFunctions {
 }
 
 #[derive(Debug, Clone)]
+pub struct FunctionsHandle {
+    state: Arc<FunctionsState>,
+}
+
+#[derive(Debug, Clone)]
 struct FunctionsState {
     project_id: String,
     active: Arc<RwLock<Option<ActiveWorker>>>,
@@ -69,7 +74,15 @@ pub struct FunctionDescriptor {
     pub entry_id: String,
     pub name: String,
     pub region: String,
+    pub generation: FunctionGeneration,
     pub trigger: TriggerKind,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FunctionGeneration {
+    Gen1,
+    Gen2,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -87,6 +100,7 @@ pub enum TriggerKind {
         topic: Option<String>,
     },
     Event {
+        #[serde(rename = "eventType")]
         event_type: Option<String>,
         resource: Option<serde_json::Value>,
     },
@@ -141,6 +155,12 @@ pub async fn prepare(config: FunctionsConfig) -> anyhow::Result<PreparedFunction
 }
 
 impl PreparedFunctions {
+    pub fn handle(&self) -> FunctionsHandle {
+        FunctionsHandle {
+            state: self.state.clone(),
+        }
+    }
+
     pub async fn serve(self) -> anyhow::Result<()> {
         let Self {
             config,
@@ -194,6 +214,104 @@ impl PreparedFunctions {
 
         result
     }
+}
+
+impl FunctionsHandle {
+    pub async fn dispatch_event(
+        &self,
+        event_type: &str,
+        attributes: &HashMap<String, String>,
+        event: &serde_json::Value,
+    ) -> usize {
+        let Some(active) = self.state.active.read().await.clone() else {
+            warn!(
+                event_type,
+                "functions worker unavailable for background event"
+            );
+            return 0;
+        };
+        let descriptors = active
+            .functions
+            .iter()
+            .filter(|descriptor| event_descriptor_matches(descriptor, event_type, attributes))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut delivered = 0;
+
+        for descriptor in descriptors {
+            let target = format!(
+                "{}/__firelite__/invoke/{}",
+                active.base_url,
+                percent_encode_path_segment(&descriptor.entry_id)
+            );
+            info!(
+                event_type,
+                function = %descriptor.entry_id,
+                generation = active.generation,
+                "running storage event"
+            );
+            match self.state.client.post(target).json(event).send().await {
+                Ok(response) if response.status().is_success() => delivered += 1,
+                Ok(response) => warn!(
+                    event_type,
+                    function = %descriptor.entry_id,
+                    status = %response.status(),
+                    "storage event handler failed"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    event_type,
+                    function = %descriptor.entry_id,
+                    "storage event dispatch failed"
+                ),
+            }
+        }
+
+        delivered
+    }
+}
+
+fn event_descriptor_matches(
+    descriptor: &FunctionDescriptor,
+    event_type: &str,
+    attributes: &HashMap<String, String>,
+) -> bool {
+    let TriggerKind::Event {
+        event_type: descriptor_type,
+        resource,
+    } = &descriptor.trigger
+    else {
+        return false;
+    };
+    let Some(descriptor_type) = descriptor_type.as_deref() else {
+        return false;
+    };
+    if descriptor_type != event_type && !is_storage_finalize_event(descriptor_type, event_type) {
+        return false;
+    }
+
+    match resource {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Object(filters)) => filters.iter().all(|(key, value)| {
+            value.as_str().is_some_and(|expected| {
+                attributes.get(key).is_some_and(|actual| actual == expected)
+            })
+        }),
+        Some(serde_json::Value::String(resource)) => {
+            attributes.get("bucket").is_some_and(|bucket| {
+                resource == bucket || resource.ends_with(&format!("/buckets/{bucket}"))
+            })
+        }
+        Some(_) => false,
+    }
+}
+
+fn is_storage_finalize_event(left: &str, right: &str) -> bool {
+    const EVENT_TYPES: [&str; 2] = [
+        "google.cloud.storage.object.v1.finalized",
+        "google.storage.object.finalize",
+    ];
+    EVENT_TYPES.contains(&left) && EVENT_TYPES.contains(&right)
 }
 
 fn app(state: Arc<FunctionsState>) -> Router {
@@ -1187,6 +1305,27 @@ mod tests {
         assert_eq!(route.suffix, "/users/1");
     }
 
+    #[test]
+    fn matches_legacy_storage_finalize_descriptor_to_gen2_event() {
+        let descriptor = FunctionDescriptor {
+            entry_id: "storage.finalize".to_string(),
+            name: "storage-finalize".to_string(),
+            region: "us-central1".to_string(),
+            generation: FunctionGeneration::Gen1,
+            trigger: TriggerKind::Event {
+                event_type: Some("google.storage.object.finalize".to_string()),
+                resource: Some(serde_json::json!("projects/_/buckets/lease-agreements")),
+            },
+        };
+        let attributes = HashMap::from([("bucket".to_string(), "lease-agreements".to_string())]);
+
+        assert!(event_descriptor_matches(
+            &descriptor,
+            "google.cloud.storage.object.v1.finalized",
+            &attributes
+        ));
+    }
+
     #[tokio::test]
     async fn starts_worker_and_discovers_http_function() {
         if !node_can_start_loopback_server().await {
@@ -1575,6 +1714,200 @@ exports.tasks.runJob.__endpoint = {
             .error_for_status()
             .unwrap();
 
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatches_one_storage_finalize_event_with_metadata_and_bucket_filter() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "firelite-storage-functions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let captured_path = dir.join("captured-events.jsonl");
+        let captured_path_js = serde_json::to_string(&captured_path.to_string_lossy()).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            &format!(
+                r#"
+const fs = require("node:fs");
+exports.storage = {{
+  processLeaseAgreement: async (event) => {{
+    fs.appendFileSync({captured_path_js}, JSON.stringify(event) + "\n");
+  }}
+}};
+exports.storage.processLeaseAgreement.__endpoint = {{
+  platform: "gcfv2",
+  id: "storage-processLeaseAgreement",
+  region: ["northamerica-northeast1"],
+  eventTrigger: {{
+    eventType: "google.cloud.storage.object.v1.finalized",
+    eventFilters: {{ bucket: "lease-agreements" }}
+  }}
+}};
+"#
+            ),
+        );
+
+        let filters = vec!["storage".to_string()];
+        let mut worker = start_worker("demo-firelite", &dir, &filters, 1)
+            .await
+            .unwrap();
+        assert_eq!(worker.active.functions.len(), 1);
+        assert!(worker.active.http_functions.is_empty());
+        let descriptor = &worker.active.functions[0];
+        assert_eq!(descriptor.entry_id, "storage.processLeaseAgreement");
+        assert_eq!(descriptor.generation, FunctionGeneration::Gen2);
+        match &descriptor.trigger {
+            TriggerKind::Event {
+                event_type,
+                resource,
+            } => {
+                assert_eq!(
+                    event_type.as_deref(),
+                    Some("google.cloud.storage.object.v1.finalized")
+                );
+                assert_eq!(
+                    resource,
+                    &Some(serde_json::json!({ "bucket": "lease-agreements" }))
+                );
+            }
+            other => panic!("expected event trigger, got {other:?}"),
+        }
+
+        let functions = FunctionsHandle {
+            state: Arc::new(FunctionsState {
+                project_id: "demo-firelite".to_string(),
+                active: Arc::new(RwLock::new(Some(worker.active.clone()))),
+                client: reqwest::Client::new(),
+            }),
+        };
+        let state = crate::server::app_state_with_functions(Some(functions));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let storage_server = tokio::spawn(async move {
+            axum::serve(listener, crate::server::storage_app_with_state(state))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        let started = client
+            .post(format!(
+                "{base_url}/v0/b/lease-agreements/o?name=user-1%2Flease.png"
+            ))
+            .header("x-goog-upload-protocol", "resumable")
+            .header("x-goog-upload-command", "start")
+            .header("x-goog-upload-header-content-length", "8")
+            .header("x-goog-upload-header-content-type", "image/png")
+            .json(&serde_json::json!({
+                "name": "user-1/lease.png",
+                "contentType": "image/png",
+                "metadata": {
+                    "user-id": "user-1",
+                    "manual-residency-id": "residency-1",
+                    "isLeaseRenewal": "true"
+                }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let upload_url = started.headers()["x-goog-upload-url"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        sleep(Duration::from_millis(50)).await;
+        assert!(!captured_path.exists());
+
+        client
+            .post(&upload_url)
+            .header("x-goog-upload-command", "upload")
+            .header("x-goog-upload-offset", "0")
+            .body("abcd")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        client
+            .post(&upload_url)
+            .header("x-goog-upload-command", "query")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert!(!captured_path.exists());
+
+        let finalized: serde_json::Value = client
+            .post(&upload_url)
+            .header("x-goog-upload-command", "upload, finalize")
+            .header("x-goog-upload-offset", "4")
+            .body("efgh")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(finalized["metadata"]["user-id"], "user-1");
+
+        timeout(Duration::from_secs(3), async {
+            while !captured_path.exists() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("storage event should be delivered");
+
+        client
+            .post(&upload_url)
+            .header("x-goog-upload-command", "query")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        client
+            .post(format!(
+                "{base_url}/v0/b/other-bucket/o?name=user-1%2Fignored.png"
+            ))
+            .header("content-type", "image/png")
+            .body("ignored")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        let captured = std::fs::read_to_string(&captured_path).unwrap();
+        let events = captured.lines().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        let event: serde_json::Value = serde_json::from_str(events[0]).unwrap();
+        assert!(event["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(event["type"], "google.cloud.storage.object.v1.finalized");
+        assert_eq!(event["subject"], "objects/user-1/lease.png");
+        assert_eq!(event["data"]["bucket"], "lease-agreements");
+        assert_eq!(event["data"]["name"], "user-1/lease.png");
+        assert_eq!(event["data"]["contentType"], "image/png");
+        assert_eq!(event["data"]["generation"], "1");
+        assert_eq!(event["data"]["metadata"]["user-id"], "user-1");
+        assert_eq!(
+            event["data"]["metadata"]["manual-residency-id"],
+            "residency-1"
+        );
+
+        storage_server.abort();
         worker.child.kill().await.unwrap();
     }
 

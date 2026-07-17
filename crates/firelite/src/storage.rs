@@ -78,6 +78,7 @@ struct BucketState {
 struct ObjectRecord {
     name: String,
     content_type: String,
+    metadata: HashMap<String, String>,
     data: Bytes,
     generation: u64,
     created_at_ms: u64,
@@ -90,6 +91,7 @@ struct ResumableUploadSession {
     bucket: String,
     name: String,
     content_type: String,
+    metadata: HashMap<String, String>,
     expected_length: Option<usize>,
     data: Vec<u8>,
     received: usize,
@@ -110,6 +112,8 @@ struct UploadQuery {
 struct UploadMetadata {
     name: Option<String>,
     content_type: Option<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,7 +129,7 @@ struct ListQuery {
     max_results: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObjectMetadata {
     kind: &'static str,
@@ -136,6 +140,7 @@ struct ObjectMetadata {
     metageneration: String,
     size: String,
     content_type: String,
+    metadata: HashMap<String, String>,
     crc32c: String,
     time_created: String,
     updated: String,
@@ -248,6 +253,7 @@ async fn upload_gcs_resumable_chunk(
     let upload = ParsedUpload {
         name: session.name,
         content_type,
+        metadata: session.metadata,
         data: body,
     };
     Ok(upload_object(&state, &session.project_id, &session.bucket, upload)?.into_response())
@@ -365,8 +371,13 @@ fn start_resumable_upload(
         .get("x-upload-content-type")
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string)
-        .or_else(|| metadata.and_then(|value| value.content_type))
+        .or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|value| value.content_type.clone())
+        })
         .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string());
+    let custom_metadata = metadata.map(|value| value.metadata).unwrap_or_default();
     let upload_id = Uuid::new_v4().to_string();
     let project_id = infer_project_id(bucket);
 
@@ -382,6 +393,7 @@ fn start_resumable_upload(
                 bucket: bucket.to_string(),
                 name,
                 content_type,
+                metadata: custom_metadata,
                 expected_length: None,
                 data: Vec::new(),
                 received: 0,
@@ -426,8 +438,13 @@ fn start_firebase_resumable_upload(
         .get("x-goog-upload-header-content-type")
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string)
-        .or_else(|| metadata.and_then(|value| value.content_type))
+        .or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|value| value.content_type.clone())
+        })
         .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_string());
+    let custom_metadata = metadata.map(|value| value.metadata).unwrap_or_default();
     let expected_length = headers
         .get("x-goog-upload-header-content-length")
         .and_then(|value| value.to_str().ok())
@@ -450,6 +467,7 @@ fn start_firebase_resumable_upload(
                 bucket: bucket.to_string(),
                 name,
                 content_type,
+                metadata: custom_metadata,
                 expected_length,
                 data: Vec::new(),
                 received: 0,
@@ -565,6 +583,7 @@ fn handle_firebase_resumable_upload(
     let session_bucket = session.bucket.clone();
     let name = session.name.clone();
     let content_type = session.content_type.clone();
+    let custom_metadata = session.metadata.clone();
     let data = std::mem::take(&mut session.data);
     drop(sessions);
     let metadata = upload_object(
@@ -574,6 +593,7 @@ fn handle_firebase_resumable_upload(
         ParsedUpload {
             name,
             content_type,
+            metadata: custom_metadata,
             data: Bytes::from(data),
         },
     )?;
@@ -639,6 +659,7 @@ fn upload_object(
     let record = ObjectRecord {
         name: upload.name.clone(),
         content_type: upload.content_type,
+        metadata: upload.metadata,
         data: upload.data,
         generation,
         created_at_ms,
@@ -646,6 +667,8 @@ fn upload_object(
     };
     let metadata = metadata(bucket, &record);
     bucket_state.objects.insert(upload.name, record);
+    drop(projects);
+    dispatch_object_finalized(state, project_id, &metadata);
 
     Ok(Json(metadata))
 }
@@ -653,6 +676,7 @@ fn upload_object(
 struct ParsedUpload {
     name: String,
     content_type: String,
+    metadata: HashMap<String, String>,
     data: Bytes,
 }
 
@@ -672,6 +696,7 @@ fn parse_upload(
             name: query_name
                 .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_OBJECT_NAME"))?,
             content_type,
+            metadata: HashMap::new(),
             data: body,
         });
     }
@@ -691,7 +716,7 @@ fn parse_upload(
         .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_MULTIPART_UPLOAD"))?;
     let media = &parts[1];
     let name = query_name
-        .or(metadata.name)
+        .or_else(|| metadata.name.clone())
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_OBJECT_NAME"))?;
     let media_content_type = metadata
         .content_type
@@ -701,6 +726,7 @@ fn parse_upload(
     Ok(ParsedUpload {
         name,
         content_type: media_content_type,
+        metadata: metadata.metadata,
         data: Bytes::from(media.body.clone()),
     })
 }
@@ -850,10 +876,75 @@ fn metadata(bucket: &str, object: &ObjectRecord) -> ObjectMetadata {
         metageneration: "1".to_string(),
         size: object.data.len().to_string(),
         content_type: object.content_type.clone(),
+        metadata: object.metadata.clone(),
         crc32c: crc32c_base64(&object.data),
         time_created: object.created_at_ms.to_string(),
         updated: object.updated_at_ms.to_string(),
     }
+}
+
+fn dispatch_object_finalized(state: &SharedState, project_id: &str, metadata: &ObjectMetadata) {
+    let Some(functions) = state.functions.clone() else {
+        return;
+    };
+    let mut attributes = HashMap::new();
+    attributes.insert("bucket".to_string(), metadata.bucket.clone());
+    let event_type = "google.cloud.storage.object.v1.finalized";
+    let event_time = format_timestamp_ms(metadata.updated.parse().unwrap_or(0));
+    let event = serde_json::json!({
+        "specversion": "1.0",
+        "id": Uuid::new_v4().to_string(),
+        "source": format!("//storage.googleapis.com/projects/_/buckets/{}", metadata.bucket),
+        "type": event_type,
+        "subject": format!("objects/{}", metadata.name),
+        "time": event_time,
+        "data": {
+            "bucket": metadata.bucket,
+            "name": metadata.name,
+            "generation": metadata.generation,
+            "metageneration": metadata.metageneration,
+            "contentType": metadata.content_type,
+            "size": metadata.size,
+            "crc32c": metadata.crc32c,
+            "timeCreated": format_timestamp_ms(metadata.time_created.parse().unwrap_or(0)),
+            "updated": format_timestamp_ms(metadata.updated.parse().unwrap_or(0)),
+            "metadata": metadata.metadata,
+        }
+    });
+    let project_id = project_id.to_string();
+    tokio::spawn(async move {
+        let delivered = functions
+            .dispatch_event(event_type, &attributes, &event)
+            .await;
+        tracing::debug!(project = %project_id, delivered, "storage finalize event dispatch complete");
+    });
+}
+
+fn format_timestamp_ms(timestamp_ms: u64) -> String {
+    let seconds = timestamp_ms / 1000;
+    let milliseconds = timestamp_ms % 1000;
+    let days = (seconds / 86_400) as i64;
+    let seconds_in_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let second = seconds_in_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
+    let days = days_since_epoch + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u64, day as u64)
 }
 
 fn crc32c_base64(data: &[u8]) -> String {

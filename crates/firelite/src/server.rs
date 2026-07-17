@@ -1,4 +1,6 @@
-use crate::{auth, config::DaemonConfig, pubsub, storage, tasks, web_ui};
+use crate::{
+    auth, config::DaemonConfig, functions::FunctionsHandle, pubsub, storage, tasks, web_ui,
+};
 use anyhow::Context;
 use axum::{
     extract::Request,
@@ -24,15 +26,21 @@ pub struct AppState {
     pub storage: storage::StorageState,
     pub pubsub: pubsub::PubsubState,
     pub tasks: tasks::TasksState,
+    pub functions: Option<FunctionsHandle>,
     pub http_client: reqwest::Client,
 }
 
 pub fn app_state() -> Arc<AppState> {
+    app_state_with_functions(None)
+}
+
+pub fn app_state_with_functions(functions: Option<FunctionsHandle>) -> Arc<AppState> {
     Arc::new(AppState {
         auth: auth::AuthState::default(),
         storage: storage::StorageState::default(),
         pubsub: pubsub::PubsubState::default(),
         tasks: tasks::TasksState::default(),
+        functions,
         http_client: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .build()

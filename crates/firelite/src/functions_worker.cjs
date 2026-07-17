@@ -30,7 +30,7 @@ async function main() {
   const handlers = new Map();
 
   for (const descriptor of functions) {
-    if (descriptor.trigger.type === "https") {
+    if (descriptor.trigger.type === "https" || descriptor.trigger.type === "event") {
       const handler = getExport(loaded, descriptor.entryId);
       if (typeof handler === "function") {
         handlers.set(descriptor.entryId, { handler, descriptor });
@@ -81,6 +81,29 @@ async function main() {
 }
 
 async function invokeHandler(req, res, handler, descriptor) {
+  if (descriptor.trigger.type === "event") {
+    const event = await readJsonBody(req);
+    const result = descriptor.generation === "gen1"
+      ? handler(event.data, {
+          eventId: event.id,
+          timestamp: event.time,
+          eventType: descriptor.trigger.eventType,
+          resource: {
+            service: "storage.googleapis.com",
+            name: `projects/_/buckets/${event.data.bucket}/objects/${event.data.name}`,
+            type: "storage#object",
+          },
+          params: {},
+        })
+      : handler(event);
+    if (result && typeof result.then === "function") {
+      await result;
+    }
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
   installHttpCompatibilityHelpers(req, res);
   if (descriptor.trigger.taskQueue) {
     req.body = await readJsonBody(req);
@@ -264,6 +287,7 @@ function describeGen1(entryId, trigger, value) {
       entryId,
       name,
       region: regions[0],
+      generation: "gen1",
       trigger: {
         type: "schedule",
         schedule: schedule.schedule || schedule,
@@ -279,6 +303,7 @@ function describeGen1(entryId, trigger, value) {
       entryId,
       name,
       region: regions[0],
+      generation: "gen1",
       trigger: {
         type: "https",
         callable: Boolean(
@@ -295,6 +320,7 @@ function describeGen1(entryId, trigger, value) {
       entryId,
       name,
       region: regions[0],
+      generation: "gen1",
       trigger: {
         type: "https",
         callable: false,
@@ -315,6 +341,7 @@ function describeGen1(entryId, trigger, value) {
         entryId,
         name,
         region: regions[0],
+        generation: "gen1",
         trigger: {
           type: "schedule",
           schedule: value.__schedule ? value.__schedule.schedule || value.__schedule : null,
@@ -329,6 +356,7 @@ function describeGen1(entryId, trigger, value) {
       entryId,
       name,
       region: regions[0],
+      generation: "gen1",
       trigger: {
         type: "event",
         eventType: trigger.eventTrigger.eventType || null,
@@ -349,6 +377,7 @@ function describeGen2(entryId, endpoint) {
       entryId,
       name,
       region,
+      generation: "gen2",
       trigger: {
         type: "schedule",
         schedule: endpoint.scheduleTrigger.schedule || endpoint.scheduleTrigger,
@@ -363,6 +392,7 @@ function describeGen2(entryId, endpoint) {
       entryId,
       name,
       region,
+      generation: "gen2",
       trigger: {
         type: "https",
         callable: Boolean(endpoint.callableTrigger),
@@ -375,6 +405,7 @@ function describeGen2(entryId, endpoint) {
       entryId,
       name,
       region,
+      generation: "gen2",
       trigger: {
         type: "https",
         callable: false,
@@ -388,6 +419,7 @@ function describeGen2(entryId, endpoint) {
       entryId,
       name,
       region,
+      generation: "gen2",
       trigger: {
         type: "event",
         eventType: endpoint.eventTrigger.eventType || null,

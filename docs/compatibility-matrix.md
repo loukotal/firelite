@@ -29,9 +29,9 @@ Status legend:
 | Storage | JSON API media upload/download/list/delete | implemented | In-memory object state with `/upload/storage/v1`, `/storage/v1`, and Firebase `/v0` object paths. Defer XML API and full Firebase Security Rules fidelity. |
 | Storage | Firebase Web SDK resumable uploads | implemented | Supports start, chunk upload, offset query, and finalization through `X-Goog-Upload-*`. |
 | Storage | Emulator bucket object inspection/reset | implemented | `/emulator/v1/projects/{project}/storage/buckets/{bucket}/objects` supports list/reset for local tests. |
-| Storage | Functions object events | unknown | Needs event flow capture. |
+| Storage | Functions object finalize events | implemented | Successful direct and resumable uploads asynchronously dispatch Gen 2 CloudEvents and Gen 1 background events with bucket filtering and custom metadata. |
 | Functions | HTTP/callable export discovery and proxying | implemented | `firelite functions` starts a checkout-local Node worker, reads gen1/gen2 metadata, and serves `/{project}/{region}/{function}` URLs. |
 | Functions | File-watch reload | implemented | Polls watched source files off the async runtime, restarts the Node worker, and swaps the active registry after successful rediscovery. Use `--no-reload` for immutable CI checkouts. |
-| Functions | Background event dispatch | planned | Auth/Pub/Sub/Storage triggers can be registered by discovery but are not dispatched yet. Cloud Tasks task queue functions are dispatched through HTTP-compatible task queue triggers. |
+| Functions | Background event dispatch | planned | Storage object finalize and Cloud Tasks queue dispatch are implemented. Auth, Pub/Sub, other Storage event types, and broader Eventarc filter semantics remain planned. |
 | Functions | Native Rust worker orchestration | planned | Long-term fast reload path if Node process startup becomes the bottleneck. |
 | Emulator Hub | locator metadata endpoints | unknown | Discovery harness should capture hub endpoints expected by SDKs/tools. |

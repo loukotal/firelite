@@ -41,7 +41,12 @@ try {
 
   await file.save(contents, {
     resumable: true,
-    contentType: "text/csv"
+    contentType: "text/csv",
+    metadata: {
+      metadata: {
+        "user-id": "gcs-user"
+      }
+    }
   });
 
   const [metadata] = await file.getMetadata();
@@ -49,6 +54,7 @@ try {
   assert.equal(metadata.name, objectPath);
   assert.equal(Number(metadata.size), contents.length);
   assert.equal(metadata.contentType, "text/csv");
+  assert.equal(metadata.metadata["user-id"], "gcs-user");
 
   const [downloaded] = await file.download();
   assert.equal(downloaded.toString("utf8"), contents.toString("utf8"));

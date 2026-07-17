@@ -53,12 +53,16 @@ try {
   const bytes = new TextEncoder().encode("hello from firebase/storage");
 
   const uploaded = await uploadBytes(objectRef, bytes, {
-    contentType: "text/plain"
+    contentType: "text/plain",
+    customMetadata: {
+      "upload-kind": "direct"
+    }
   });
   assert.equal(uploaded.metadata.bucket, "demo-firelite.appspot.com");
   assert.equal(uploaded.metadata.fullPath, objectPath);
   assert.equal(uploaded.metadata.size, bytes.length);
   assert.equal(uploaded.metadata.contentType, "text/plain");
+  assert.equal(uploaded.metadata.customMetadata["upload-kind"], "direct");
 
   const metadata = await getMetadata(objectRef);
   assert.equal(metadata.fullPath, objectPath);
@@ -77,9 +81,18 @@ try {
   const resumableRef = ref(storage, `sdk/${Date.now()}/lease.pdf`);
   const resumableBytes = new Uint8Array(300_000).fill(42);
   const resumable = await uploadBytesResumable(resumableRef, resumableBytes, {
-    contentType: "application/pdf"
+    contentType: "application/pdf",
+    customMetadata: {
+      "user-id": "sdk-user",
+      "manual-residency-id": "sdk-residency"
+    }
   });
   assert.equal(resumable.metadata.size, resumableBytes.length);
+  assert.equal(resumable.metadata.customMetadata["user-id"], "sdk-user");
+  assert.equal(
+    resumable.metadata.customMetadata["manual-residency-id"],
+    "sdk-residency"
+  );
 
   await deleteApp(app);
   console.log("firebase/storage SDK E2E passed");

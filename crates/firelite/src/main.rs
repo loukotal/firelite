@@ -121,7 +121,6 @@ async fn main() -> anyhow::Result<()> {
             filters,
             no_reload,
         } => {
-            let state = server::app_state();
             let daemon_addr = parse_addr("auth daemon", &host, auth_port)?;
             let pubsub_addr = parse_addr("pubsub", &host, pubsub_port)?;
             let tasks_addr = parse_addr("cloud tasks", &host, tasks_port)?;
@@ -135,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
                 reload_on_change: !no_reload,
             })
             .await?;
+            let state = server::app_state_with_functions(Some(functions.handle()));
 
             state.tasks.set_functions_target(FunctionsTarget {
                 project_id: project,

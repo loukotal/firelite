@@ -31,12 +31,29 @@ pub struct AppState {
 }
 
 pub fn app_state() -> Arc<AppState> {
-    app_state_with_functions(None)
+    app_state_for_project(environment_project_id())
 }
 
 pub fn app_state_with_functions(functions: Option<FunctionsHandle>) -> Arc<AppState> {
+    app_state_with_functions_for_project(environment_project_id(), functions)
+}
+
+fn environment_project_id() -> String {
+    std::env::var("GCLOUD_PROJECT")
+        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+        .unwrap_or_else(|_| "demo-firelite".to_string())
+}
+
+pub fn app_state_for_project(project_id: impl Into<String>) -> Arc<AppState> {
+    app_state_with_functions_for_project(project_id, None)
+}
+
+pub fn app_state_with_functions_for_project(
+    project_id: impl Into<String>,
+    functions: Option<FunctionsHandle>,
+) -> Arc<AppState> {
     Arc::new(AppState {
-        auth: auth::AuthState::default(),
+        auth: auth::AuthState::new(project_id),
         storage: storage::StorageState::default(),
         pubsub: pubsub::PubsubState::default(),
         tasks: tasks::TasksState::default(),
@@ -50,6 +67,10 @@ pub fn app_state_with_functions(functions: Option<FunctionsHandle>) -> Arc<AppSt
 
 pub fn app() -> Router {
     app_with_state(app_state())
+}
+
+pub fn app_for_project(project_id: impl Into<String>) -> Router {
+    app_with_state(app_state_for_project(project_id))
 }
 
 pub fn app_with_state(state: Arc<AppState>) -> Router {
@@ -98,6 +119,13 @@ pub fn pubsub_app_with_state(state: Arc<AppState>) -> Router {
 
 pub async fn serve(config: DaemonConfig) -> anyhow::Result<()> {
     serve_router("firelite daemon", config, app()).await
+}
+
+pub async fn serve_for_project(
+    config: DaemonConfig,
+    project_id: impl Into<String>,
+) -> anyhow::Result<()> {
+    serve_router("firelite daemon", config, app_for_project(project_id)).await
 }
 
 pub async fn serve_with_state(

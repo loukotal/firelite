@@ -9,7 +9,7 @@ Status legend:
 
 | Service | Surface | Status | Notes |
 | --- | --- | --- | --- |
-| Auth | `accounts:signUp` password user create | implemented | In-memory, default project `demo-firelite` for Identity Toolkit paths. |
+| Auth | `accounts:signUp` password user create | implemented | Project-less Identity Toolkit client paths use the project configured when the emulator starts. |
 | Auth | `signInAnonymously` / anonymous `accounts:signUp` | implemented | Anonymous account lookup, refresh, token claims, and deletion are SDK-tested. |
 | Auth | `accounts:signInWithPassword` | implemented | Password hash is local-only and not production-compatible. |
 | Auth | `accounts:lookup` by ID token/local ID | implemented | Unsigned local JWT-like token, sufficient for local contract flow. |
@@ -19,6 +19,7 @@ Status legend:
 | Auth | `accounts:sendOobCode` / `accounts:signInWithEmailLink` | implemented | In-memory single-use email-link OOB codes. |
 | Auth | Phone MFA enrollment and sign-in | implemented | Supports v2 enrollment/sign-in start and finalize, inspectable SMS codes, `mfaInfo`, MFA-required password responses, and second-factor token claims. |
 | Auth | `/emulator/v1/projects/{project}/verificationCodes` | implemented | Lists pending phone verification sessions and codes for local tests. |
+| Auth | Web reCAPTCHA discovery | implemented | Matches firebase-tools fallback behavior: v2 Enterprise config returns structured 501 and v1 params return the emulator fake site key/token. |
 | Auth | `/emulator/v1/projects/{project}/oobCodes` | implemented | Local inspection endpoint for email-link tests/debugging. |
 | Auth | `/emulator/v1/projects/{project}/accounts` list/reset | implemented | Used for test isolation and fixture comparison. |
 | Auth | Admin SDK `createUser`, `getUser`, `getUserByEmail`, `listUsers`, `deleteUser` | implemented | Covered by Firebase Admin SDK E2E harness. |

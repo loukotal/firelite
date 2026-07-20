@@ -28,6 +28,14 @@ pub fn router() -> Router<SharedState> {
             post(refresh_secure_token).options(preflight),
         )
         .route(
+            "/identitytoolkit.googleapis.com/v1/recaptchaParams",
+            get(recaptcha_params).options(preflight),
+        )
+        .route(
+            "/identitytoolkit.googleapis.com/v2/recaptchaConfig",
+            get(recaptcha_config).options(preflight),
+        )
+        .route(
             "/identitytoolkit.googleapis.com/v1/*action",
             post(identity_action)
                 .get(identity_get_action)
@@ -56,9 +64,29 @@ pub fn router() -> Router<SharedState> {
         .route("/emulator/action", get(oob_action))
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AuthState {
+    default_project_id: String,
     projects: Arc<RwLock<HashMap<String, ProjectAuthState>>>,
+}
+
+impl AuthState {
+    pub fn new(default_project_id: impl Into<String>) -> Self {
+        Self {
+            default_project_id: default_project_id.into(),
+            projects: Arc::default(),
+        }
+    }
+
+    fn default_project_id(&self) -> &str {
+        &self.default_project_id
+    }
+}
+
+impl Default for AuthState {
+    fn default() -> Self {
+        Self::new(DEFAULT_PROJECT)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -476,6 +504,33 @@ async fn preflight() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+async fn recaptcha_params() -> Json<serde_json::Value> {
+    Json(json!({
+        "kind": "identitytoolkit#GetRecaptchaParamResponse",
+        "recaptchaStoken": "This-is-a-fake-token__Dont-send-this-to-the-Recaptcha-service__The-Auth-Emulator-does-not-support-Recaptcha",
+        "recaptchaSiteKey": "Fake-key__Do-not-send-this-to-Recaptcha_",
+    }))
+}
+
+async fn recaptcha_config() -> Response {
+    let message = "identitytoolkit.getRecaptchaConfig is not implemented in the Auth Emulator.";
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": {
+                "code": 501,
+                "message": message,
+                "errors": [{
+                    "message": message,
+                    "reason": "unimplemented"
+                }],
+                "status": "NOT_IMPLEMENTED"
+            }
+        })),
+    )
+        .into_response()
+}
+
 async fn refresh_secure_token(
     State(state): State<SharedState>,
     Form(payload): Form<RefreshTokenRequest>,
@@ -484,6 +539,9 @@ async fn refresh_secure_token(
         return Err(error(StatusCode::BAD_REQUEST, "UNSUPPORTED_GRANT_TYPE"));
     }
     let refresh = parse_refresh_token(&payload.refresh_token)?;
+    if refresh.project_id != state.auth.default_project_id() {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_REFRESH_TOKEN"));
+    }
     let project_id = refresh.project_id;
     let local_id = refresh.local_id;
     let projects = state.auth.projects.read().expect("auth state poisoned");
@@ -549,7 +607,7 @@ async fn identity_action(
             let payload = parse_payload(payload)?;
             serde_json::to_value(send_oob_code(
                 &state,
-                &default_project_id(),
+                state.auth.default_project_id(),
                 &auth_base_url,
                 payload,
             )?)
@@ -650,7 +708,9 @@ async fn oob_action(
     State(state): State<SharedState>,
     Query(query): Query<OobActionQuery>,
 ) -> AuthResult<serde_json::Value> {
-    let project_id = query.project_id.unwrap_or_else(default_project_id);
+    let project_id = query
+        .project_id
+        .unwrap_or_else(|| state.auth.default_project_id().to_string());
     let oob_code = query
         .oob_code
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_OOB_CODE"))?;
@@ -671,7 +731,7 @@ async fn oob_action(
 }
 
 fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, AuthError> {
-    let project_id = default_project_id();
+    let project_id = state.auth.default_project_id().to_string();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.to_string()).or_default();
     let (email, password) = match (payload.email, payload.password) {
@@ -872,7 +932,7 @@ fn sign_in_with_password(
     state: &SharedState,
     payload: SignInRequest,
 ) -> Result<serde_json::Value, AuthError> {
-    let project_id = project_id_for_email(&state.auth, &payload.email);
+    let project_id = state.auth.default_project_id().to_string();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.to_string()).or_default();
     let email_key = normalize_email(&payload.email);
@@ -926,7 +986,7 @@ fn start_mfa_enrollment(
     state: &SharedState,
     payload: MfaEnrollmentStartRequest,
 ) -> Result<serde_json::Value, AuthError> {
-    let claims = parse_token_claims(&payload.id_token)?;
+    let claims = parse_client_token_claims(&state.auth, &payload.id_token)?;
     if !is_valid_phone_number(&payload.phone_enrollment_info.phone_number) {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_PHONE_NUMBER"));
     }
@@ -968,7 +1028,7 @@ fn finalize_mfa_enrollment(
     state: &SharedState,
     payload: MfaEnrollmentFinalizeRequest,
 ) -> Result<serde_json::Value, AuthError> {
-    let claims = parse_token_claims(&payload.id_token)?;
+    let claims = parse_client_token_claims(&state.auth, &payload.id_token)?;
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects
         .get_mut(&claims.project_id)
@@ -1257,7 +1317,7 @@ fn lookup(state: &SharedState, payload: LookupRequest) -> Result<LookupResponse,
 
     let mut users = Vec::new();
     if let Some(id_token) = payload.id_token {
-        let claims = parse_token_claims(&id_token)?;
+        let claims = parse_client_token_claims(&state.auth, &id_token)?;
         if let Some(record) = projects
             .get(&claims.project_id)
             .and_then(|project| project.users_by_id.get(&claims.local_id))
@@ -1272,7 +1332,7 @@ fn lookup(state: &SharedState, payload: LookupRequest) -> Result<LookupResponse,
         }
     }
     if let Some(local_ids) = payload.local_id {
-        let project_id = default_project_id();
+        let project_id = state.auth.default_project_id().to_string();
         if let Some(project) = projects.get(&project_id) {
             users.extend(
                 local_ids
@@ -1291,9 +1351,9 @@ fn delete_identity_account(
     payload: DeleteRequest,
 ) -> Result<EmptyResponse, AuthError> {
     let (project_id, local_id) = match (payload.local_id, payload.id_token) {
-        (Some(local_id), _) => (default_project_id(), local_id),
+        (Some(local_id), _) => (state.auth.default_project_id().to_string(), local_id),
         (None, Some(id_token)) => {
-            let claims = parse_token_claims(&id_token)?;
+            let claims = parse_client_token_claims(&state.auth, &id_token)?;
             (claims.project_id, claims.local_id)
         }
         (None, None) => return Err(error(StatusCode::BAD_REQUEST, "MISSING_LOCAL_ID")),
@@ -1307,7 +1367,7 @@ fn sign_in_with_custom_token(
     state: &SharedState,
     payload: CustomTokenRequest,
 ) -> Result<AuthResponse, AuthError> {
-    let project_id = default_project_id();
+    let project_id = state.auth.default_project_id().to_string();
     let local_id = parse_custom_token_subject(&payload.token)?;
     let email = format!("{local_id}@custom-token.local");
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
@@ -1323,7 +1383,7 @@ fn sign_in_with_custom_token(
 }
 
 fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResponse, AuthError> {
-    let project_id = default_project_id();
+    let project_id = state.auth.default_project_id().to_string();
     let _request_uri = payload.request_uri.as_deref().unwrap_or("http://localhost");
     let post_body = parse_post_body(&payload.post_body);
     let provider_id = post_body
@@ -1443,7 +1503,7 @@ fn sign_in_with_email_link(
     state: &SharedState,
     payload: EmailLinkRequest,
 ) -> Result<AuthResponse, AuthError> {
-    let project_id = default_project_id();
+    let project_id = state.auth.default_project_id().to_string();
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.clone()).or_default();
     let Some(code) = project.oob_codes.remove(&payload.oob_code) else {
@@ -1935,7 +1995,7 @@ struct TokenClaims {
     issued_at: u64,
 }
 
-fn parse_token_claims(token: &str) -> Result<TokenClaims, AuthError> {
+fn parse_token_claims(token: &str, fallback_project_id: &str) -> Result<TokenClaims, AuthError> {
     let Some(payload) = token.split('.').nth(1) else {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_ID_TOKEN"));
     };
@@ -1953,13 +2013,21 @@ fn parse_token_claims(token: &str) -> Result<TokenClaims, AuthError> {
         .get("aud")
         .and_then(|aud| aud.as_str())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(default_project_id);
+        .unwrap_or_else(|| fallback_project_id.to_string());
     let issued_at = value.get("iat").and_then(|iat| iat.as_u64()).unwrap_or(0);
     Ok(TokenClaims {
         project_id,
         local_id,
         issued_at,
     })
+}
+
+fn parse_client_token_claims(auth: &AuthState, token: &str) -> Result<TokenClaims, AuthError> {
+    let claims = parse_token_claims(token, auth.default_project_id())?;
+    if claims.project_id != auth.default_project_id() {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_ID_TOKEN"));
+    }
+    Ok(claims)
 }
 
 fn normalize_email(email: &str) -> String {
@@ -2095,26 +2163,6 @@ fn create_verification_code(
 
 fn error(status: StatusCode, message: &'static str) -> AuthError {
     AuthError { status, message }
-}
-
-fn default_project_id() -> String {
-    std::env::var("GCLOUD_PROJECT")
-        .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
-        .unwrap_or_else(|_| DEFAULT_PROJECT.to_string())
-}
-
-fn project_id_for_email(auth: &AuthState, email: &str) -> String {
-    let email_key = normalize_email(email);
-    let projects = auth.projects.read().expect("auth state poisoned");
-    projects
-        .iter()
-        .find_map(|(project_id, project)| {
-            project
-                .user_ids_by_email
-                .contains_key(&email_key)
-                .then(|| project_id.clone())
-        })
-        .unwrap_or_else(default_project_id)
 }
 
 fn project_id_for_mfa_pending(auth: &AuthState, credential: &str) -> Option<String> {

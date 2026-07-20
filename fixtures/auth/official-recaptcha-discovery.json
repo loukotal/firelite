@@ -1,0 +1,45 @@
+{
+  "source": "firebase-tools-13.35.1-auth-emulator-contract",
+  "capturedAt": "2026-07-17T00:00:00.000Z",
+  "service": "auth",
+  "steps": [
+    {
+      "name": "enterprise-config-fallback",
+      "request": {
+        "method": "GET",
+        "path": "/identitytoolkit.googleapis.com/v2/recaptchaConfig?key=fake&clientType=CLIENT_TYPE_WEB&version=RECAPTCHA_ENTERPRISE"
+      },
+      "response": {
+        "status": 501,
+        "body": {
+          "error": {
+            "code": 501,
+            "message": "identitytoolkit.getRecaptchaConfig is not implemented in the Auth Emulator.",
+            "errors": [
+              {
+                "message": "identitytoolkit.getRecaptchaConfig is not implemented in the Auth Emulator.",
+                "reason": "unimplemented"
+              }
+            ],
+            "status": "NOT_IMPLEMENTED"
+          }
+        }
+      }
+    },
+    {
+      "name": "recaptcha-v2-params",
+      "request": {
+        "method": "GET",
+        "path": "/identitytoolkit.googleapis.com/v1/recaptchaParams?key=fake"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "kind": "identitytoolkit#GetRecaptchaParamResponse",
+          "recaptchaStoken": "This-is-a-fake-token__Dont-send-this-to-the-Recaptcha-service__The-Auth-Emulator-does-not-support-Recaptcha",
+          "recaptchaSiteKey": "Fake-key__Do-not-send-this-to-Recaptcha_"
+        }
+      }
+    }
+  ]
+}

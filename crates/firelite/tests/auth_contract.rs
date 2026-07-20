@@ -982,8 +982,8 @@ async fn auth_revoke_refresh_tokens_invalidates_old_id_and_refresh_tokens() {
 }
 
 #[tokio::test]
-async fn auth_password_sign_in_finds_admin_created_user_project() {
-    let base_url = spawn_app().await;
+async fn auth_password_sign_in_uses_configured_project() {
+    let base_url = spawn_app_for_project("bf-demo-a24dc").await;
     let client = reqwest::Client::new();
 
     client
@@ -1040,6 +1040,126 @@ async fn auth_password_sign_in_finds_admin_created_user_project() {
         .unwrap();
 
     assert_eq!(lookup["users"][0]["email"], "admin-created@example.test");
+}
+
+#[tokio::test]
+async fn auth_recaptcha_discovery_and_mfa_codes_use_configured_project() {
+    let base_url = spawn_app_for_project("bf-demo-a24dc").await;
+    let client = reqwest::Client::new();
+
+    let enterprise = client
+        .get(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/recaptchaConfig?key=fake&clientType=CLIENT_TYPE_WEB&version=RECAPTCHA_ENTERPRISE"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enterprise.status(), StatusCode::NOT_IMPLEMENTED);
+    let enterprise_body: Value = enterprise.json().await.unwrap();
+    assert_eq!(enterprise_body["error"]["code"], 501);
+    assert_eq!(enterprise_body["error"]["status"], "NOT_IMPLEMENTED");
+    assert_eq!(
+        enterprise_body["error"]["errors"][0]["reason"],
+        "unimplemented"
+    );
+
+    let recaptcha: Value = client
+        .get(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/recaptchaParams?key=fake"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        recaptcha["kind"],
+        "identitytoolkit#GetRecaptchaParamResponse"
+    );
+    assert_eq!(
+        recaptcha["recaptchaSiteKey"],
+        "Fake-key__Do-not-send-this-to-Recaptcha_"
+    );
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake"
+        ))
+        .json(&json!({
+            "email": "configured-mfa@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = decode_jwt_payload(created["idToken"].as_str().unwrap());
+    assert_eq!(token["aud"], "bf-demo-a24dc");
+
+    let started: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:start?key=fake"
+        ))
+        .json(&json!({
+            "idToken": created["idToken"],
+            "phoneEnrollmentInfo": {
+                "phoneNumber": "+15555550123",
+                "recaptchaToken": "emulator-token",
+                "clientType": "CLIENT_TYPE_WEB"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session = started["phoneSessionInfo"]["sessionInfo"].as_str().unwrap();
+
+    let configured_codes: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/bf-demo-a24dc/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        configured_codes["verificationCodes"][0]["sessionInfo"],
+        session
+    );
+    assert_eq!(
+        configured_codes["verificationCodes"][0]["phoneNumber"],
+        "+15555550123"
+    );
+
+    let default_codes: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(default_codes["verificationCodes"], json!([]));
 }
 
 #[tokio::test]
@@ -1341,10 +1461,15 @@ async fn auth_admin_password_reset_link_creates_oob_link() {
 }
 
 async fn spawn_app() -> String {
+    spawn_app_for_project("demo-firelite").await
+}
+
+async fn spawn_app_for_project(project_id: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let app = server::app_for_project(project_id.to_string());
     tokio::spawn(async move {
-        axum::serve(listener, server::app()).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
 }

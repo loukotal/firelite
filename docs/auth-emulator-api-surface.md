@@ -27,9 +27,11 @@ This tracks the `firebase/auth` client APIs currently used by the app and the em
 | `signInWithCustomToken` | `accounts:signInWithCustomToken` | implemented | Accepts unsigned local JWT-like tokens or plain local IDs for tests. |
 | `multiFactor` phone enrollment | v2 `accounts/mfaEnrollment:start` and `accounts/mfaEnrollment:finalize` | implemented | Uses inspectable, single-use emulator SMS codes and persists factors in `mfaInfo`. |
 | `getMultiFactorResolver` phone sign-in | Password first factor plus v2 `accounts/mfaSignIn:start` and `accounts/mfaSignIn:finalize` | implemented | Password login returns `mfaPendingCredential`; completed and refreshed tokens retain phone second-factor claims. |
+| `RecaptchaVerifier` emulator discovery | v2 `recaptchaConfig` fallback and v1 `recaptchaParams` | implemented | Returns the same Enterprise 501 fallback and fake v2 site key/token as firebase-tools 13.35.1. |
 
 ## Implementation notes
 
 - Capture official Firebase Auth emulator fixtures before implementing each planned server endpoint.
 - Keep client-only helpers in this list so workflow coverage stays visible, even when no Firelite endpoint is required.
 - Provider support should start with the providers the app imports: Google and Microsoft-compatible OAuth.
+- Project-less Auth client endpoints use the project configured at emulator startup; Admin and emulator-management routes continue to use their explicit project path.

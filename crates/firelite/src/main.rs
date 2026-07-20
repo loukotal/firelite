@@ -24,6 +24,8 @@ struct Cli {
 enum Command {
     /// Run the shared lightweight backend daemon.
     Daemon {
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 9099)]
@@ -83,9 +85,13 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     match Cli::parse().command {
-        Command::Daemon { host, port } => {
+        Command::Daemon {
+            project,
+            host,
+            port,
+        } => {
             let addr = parse_addr("daemon", &host, port)?;
-            server::serve(DaemonConfig { addr }).await
+            server::serve_for_project(DaemonConfig { addr }, resolve_project(project)).await
         }
         Command::Reset { project } => {
             println!("reset is scaffolded: project={project}");
@@ -134,7 +140,10 @@ async fn main() -> anyhow::Result<()> {
                 reload_on_change: !no_reload,
             })
             .await?;
-            let state = server::app_state_with_functions(Some(functions.handle()));
+            let state = server::app_state_with_functions_for_project(
+                project.clone(),
+                Some(functions.handle()),
+            );
 
             state.tasks.set_functions_target(FunctionsTarget {
                 project_id: project,
@@ -173,6 +182,13 @@ fn parse_addr(label: &str, host: &str, port: u16) -> anyhow::Result<SocketAddr> 
     format!("{host}:{port}")
         .parse()
         .with_context(|| format!("invalid {label} address {host}:{port}"))
+}
+
+fn resolve_project(project: Option<String>) -> String {
+    project
+        .or_else(|| std::env::var("GCLOUD_PROJECT").ok())
+        .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT").ok())
+        .unwrap_or_else(|| "demo-firelite".to_string())
 }
 
 fn init_tracing() {

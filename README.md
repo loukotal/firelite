@@ -29,6 +29,18 @@ The immediate goal is to discover local SDK/emulator contracts, capture them as 
 cargo run -p firelite -- daemon --host 127.0.0.1 --port 9099
 ```
 
+To keep Auth users between runs, pass a SQLite database path:
+
+```sh
+cargo run -p firelite -- daemon --project demo-firelite --persist .firelite/state.sqlite
+```
+
+Persistence is opt-in. The same `--persist` option is available on `emulators`. Reset one project's persisted Auth users with:
+
+```sh
+cargo run -p firelite -- reset --project demo-firelite --persist .firelite/state.sqlite
+```
+
 Then point SDKs at the Auth emulator:
 
 ```sh
@@ -48,16 +60,16 @@ curl -s 'http://127.0.0.1:9099/identitytoolkit.googleapis.com/v1/accounts:signUp
 
 ```sh
 firelite daemon
-firelite reset --project demo-myrepo-agent-17
+firelite reset --project demo-myrepo-agent-17 --persist .firelite/state.sqlite
 firelite functions --project demo-myrepo-agent-17 --watch ./functions --port 5001
 firelite emulators --project demo-myrepo-agent-17 --watch ./functions
 firelite emulators --project demo-myrepo-agent-17 --watch ./functions --filter api
 firelite emulators --project demo-myrepo-agent-17 --watch ./functions --no-reload
 ```
 
-`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. TypeScript functions should be built by the surrounding test/dev workflow before Firelite loads the functions directory. `reset` is still present to lock the UX surface and will be wired to per-project state reset in later milestones.
+`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. TypeScript functions should be built by the surrounding test/dev workflow before Firelite loads the functions directory. `reset` removes one project's Auth users from the SQLite database selected by `--persist`.
 
-`emulators` runs Auth, Storage, Pub/Sub, Cloud Tasks, and Functions together. By default it listens on the local setup ports: Auth on `127.0.0.1:9099`, Storage on `127.0.0.1:9199`, Pub/Sub on `127.0.0.1:8085`, Cloud Tasks on `127.0.0.1:9899`, and Functions on `127.0.0.1:5001`. The listeners share the same in-memory state.
+`emulators` runs Auth, Storage, Pub/Sub, Cloud Tasks, and Functions together. By default it listens on the local setup ports: Auth on `127.0.0.1:9099`, Storage on `127.0.0.1:9199`, Pub/Sub on `127.0.0.1:8085`, Cloud Tasks on `127.0.0.1:9899`, and Functions on `127.0.0.1:5001`. The listeners share the same state. `--persist <FILE>` persists Auth users; other service state remains in memory.
 
 For CI runs where function source does not change after startup, pass `--no-reload` to skip the file polling task. The combined runner loads and validates the initial Functions worker before opening the other emulator listeners. The Functions listener reports worker liveness at `/__/health`.
 

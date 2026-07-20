@@ -2,7 +2,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use firelite::server;
 use reqwest::{header, StatusCode};
 use serde_json::{json, Value};
+use std::{path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn auth_create_sign_in_list_delete_flow() {
@@ -1460,6 +1462,84 @@ async fn auth_admin_password_reset_link_creates_oob_link() {
     assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn auth_users_persist_across_app_restarts_and_can_be_reset() {
+    let database = temporary_database_path();
+    let client = reqwest::Client::new();
+    let state = server::app_state_with_functions_for_project_persistent(
+        "demo-persist",
+        None,
+        database.clone(),
+    )
+    .unwrap();
+    let base_url = spawn_app_with_state(state).await;
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake"
+        ))
+        .json(&json!({
+            "email": "persisted@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let restarted_state = server::app_state_with_functions_for_project_persistent(
+        "demo-persist",
+        None,
+        database.clone(),
+    )
+    .unwrap();
+    let restarted_url = spawn_app_with_state(restarted_state).await;
+    let signed_in: Value = client
+        .post(format!(
+            "{restarted_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "persisted@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(signed_in["email"], "persisted@example.test");
+
+    firelite::auth::AuthState::reset_persisted_project(&database, "demo-persist").unwrap();
+    let reset_state = server::app_state_with_functions_for_project_persistent(
+        "demo-persist",
+        None,
+        database.clone(),
+    )
+    .unwrap();
+    let reset_url = spawn_app_with_state(reset_state).await;
+    let listed: Value = client
+        .get(format!(
+            "{reset_url}/emulator/v1/projects/demo-persist/accounts"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed["users"].as_array().unwrap().is_empty());
+
+    std::fs::remove_file(database).unwrap();
+}
+
 async fn spawn_app() -> String {
     spawn_app_for_project("demo-firelite").await
 }
@@ -1472,6 +1552,21 @@ async fn spawn_app_for_project(project_id: &str) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+async fn spawn_app_with_state(state: Arc<server::AppState>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, server::app_with_state(state))
+            .await
+            .unwrap();
+    });
+    format!("http://{addr}")
+}
+
+fn temporary_database_path() -> PathBuf {
+    std::env::temp_dir().join(format!("firelite-auth-{}.sqlite", Uuid::new_v4()))
 }
 
 fn unsigned_jwt(payload: Value) -> String {

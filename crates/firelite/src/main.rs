@@ -30,11 +30,17 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 9099)]
         port: u16,
+        /// Persist Auth users in this SQLite database.
+        #[arg(long)]
+        persist: Option<PathBuf>,
     },
     /// Reset state for a project namespace.
     Reset {
         #[arg(long)]
         project: String,
+        /// SQLite database containing the project state.
+        #[arg(long)]
+        persist: PathBuf,
     },
     /// Run or watch checkout-specific Cloud Functions workers.
     Functions {
@@ -77,6 +83,9 @@ enum Command {
         /// Disable source polling and automatic worker reloads. Recommended in CI.
         #[arg(long)]
         no_reload: bool,
+        /// Persist Auth users in this SQLite database.
+        #[arg(long)]
+        persist: Option<PathBuf>,
     },
 }
 
@@ -89,12 +98,24 @@ async fn main() -> anyhow::Result<()> {
             project,
             host,
             port,
+            persist,
         } => {
             let addr = parse_addr("daemon", &host, port)?;
-            server::serve_for_project(DaemonConfig { addr }, resolve_project(project)).await
+            let project = resolve_project(project);
+            if let Some(path) = persist {
+                let state =
+                    server::app_state_with_functions_for_project_persistent(project, None, path)?;
+                server::serve_with_state("firelite daemon", DaemonConfig { addr }, state).await
+            } else {
+                server::serve_for_project(DaemonConfig { addr }, project).await
+            }
         }
-        Command::Reset { project } => {
-            println!("reset is scaffolded: project={project}");
+        Command::Reset { project, persist } => {
+            firelite::auth::AuthState::reset_persisted_project(&persist, &project)?;
+            println!(
+                "reset Auth state: project={project} database={}",
+                persist.display()
+            );
             Ok(())
         }
         Command::Functions {
@@ -126,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
             watch,
             filters,
             no_reload,
+            persist,
         } => {
             let daemon_addr = parse_addr("auth daemon", &host, auth_port)?;
             let pubsub_addr = parse_addr("pubsub", &host, pubsub_port)?;
@@ -140,10 +162,18 @@ async fn main() -> anyhow::Result<()> {
                 reload_on_change: !no_reload,
             })
             .await?;
-            let state = server::app_state_with_functions_for_project(
-                project.clone(),
-                Some(functions.handle()),
-            );
+            let state = if let Some(path) = persist {
+                server::app_state_with_functions_for_project_persistent(
+                    project.clone(),
+                    Some(functions.handle()),
+                    path,
+                )?
+            } else {
+                server::app_state_with_functions_for_project(
+                    project.clone(),
+                    Some(functions.handle()),
+                )
+            };
 
             state.tasks.set_functions_target(FunctionsTarget {
                 project_id: project,

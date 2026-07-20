@@ -1,4 +1,5 @@
 use crate::server::AppState;
+use anyhow::Context;
 use axum::{
     extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -7,12 +8,14 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    path::{Path as FilePath, PathBuf},
+    sync::{Arc, Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -68,6 +71,8 @@ pub fn router() -> Router<SharedState> {
 pub struct AuthState {
     default_project_id: String,
     projects: Arc<RwLock<HashMap<String, ProjectAuthState>>>,
+    persistence_path: Option<Arc<PathBuf>>,
+    persistence_lock: Arc<Mutex<()>>,
 }
 
 impl AuthState {
@@ -75,7 +80,73 @@ impl AuthState {
         Self {
             default_project_id: default_project_id.into(),
             projects: Arc::default(),
+            persistence_path: None,
+            persistence_lock: Arc::default(),
         }
+    }
+
+    pub fn persistent(
+        default_project_id: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let path = path.into();
+        let projects = load_projects(&path)?;
+        Ok(Self {
+            default_project_id: default_project_id.into(),
+            projects: Arc::new(RwLock::new(projects)),
+            persistence_path: Some(Arc::new(path)),
+            persistence_lock: Arc::default(),
+        })
+    }
+
+    pub fn persist(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(());
+        };
+        let _persistence_guard = self
+            .persistence_lock
+            .lock()
+            .expect("Auth persistence lock poisoned");
+        let snapshots = {
+            let projects = self.projects.read().expect("auth state poisoned");
+            projects
+                .iter()
+                .map(|(project_id, project)| {
+                    let users = project.users_by_id.values().cloned().collect::<Vec<_>>();
+                    serde_json::to_string(&users)
+                        .map(|users| (project_id.clone(), users))
+                        .map_err(anyhow::Error::from)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+
+        let mut connection = open_database(path)?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM auth_projects", [])?;
+        for (project_id, users) in snapshots {
+            transaction.execute(
+                "INSERT INTO auth_projects (project_id, users_json) VALUES (?1, ?2)",
+                params![project_id, users],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistence_path.is_some()
+    }
+
+    pub fn reset_persisted_project(
+        path: impl AsRef<FilePath>,
+        project_id: &str,
+    ) -> anyhow::Result<()> {
+        let connection = open_database(path.as_ref())?;
+        connection.execute(
+            "DELETE FROM auth_projects WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
     }
 
     fn default_project_id(&self) -> &str {
@@ -89,6 +160,45 @@ impl Default for AuthState {
     }
 }
 
+fn open_database(path: &FilePath) -> anyhow::Result<Connection> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create persistence directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let connection = Connection::open(path)
+        .with_context(|| format!("failed to open persistence database {}", path.display()))?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS auth_projects (
+            project_id TEXT PRIMARY KEY NOT NULL,
+            users_json TEXT NOT NULL
+        );",
+    )?;
+    Ok(connection)
+}
+
+fn load_projects(path: &FilePath) -> anyhow::Result<HashMap<String, ProjectAuthState>> {
+    let connection = open_database(path)?;
+    let mut statement = connection.prepare("SELECT project_id, users_json FROM auth_projects")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut projects = HashMap::new();
+    for row in rows {
+        let (project_id, users_json) = row?;
+        let users: Vec<UserRecord> = serde_json::from_str(&users_json)
+            .with_context(|| format!("invalid persisted Auth state for project {project_id}"))?;
+        projects.insert(project_id, ProjectAuthState::from_users(users));
+    }
+    Ok(projects)
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProjectAuthState {
     users_by_id: HashMap<String, UserRecord>,
@@ -100,7 +210,34 @@ struct ProjectAuthState {
     mfa_pending_credentials: HashMap<String, MfaPendingCredential>,
 }
 
-#[derive(Debug, Clone)]
+impl ProjectAuthState {
+    fn from_users(users: Vec<UserRecord>) -> Self {
+        let mut project = Self::default();
+        for user in users {
+            let local_id = user.local_id.clone();
+            if !user.email.is_empty() {
+                project
+                    .user_ids_by_email
+                    .insert(normalize_email(&user.email), local_id.clone());
+            }
+            if let Some(phone_number) = &user.phone_number {
+                project
+                    .user_ids_by_phone
+                    .insert(phone_number.clone(), local_id.clone());
+            }
+            for provider in &user.providers {
+                project.user_ids_by_provider.insert(
+                    (provider.provider_id.clone(), provider.raw_id.clone()),
+                    local_id.clone(),
+                );
+            }
+            project.users_by_id.insert(local_id, user);
+        }
+        project
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserRecord {
     local_id: String,
     email: String,
@@ -118,7 +255,7 @@ struct UserRecord {
     last_login_at_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderRecord {
     provider_id: String,
     raw_id: String,

@@ -13,10 +13,11 @@ Firelite separates checkout-specific process work from shared stateful emulator 
 ## Modules
 
 - `firelite daemon`: shared backend process for stateful emulator-compatible services.
-- `firelite reset`: planned per-project state reset across all enabled services.
+- `firelite reset`: removes one project's persisted Auth users; reset support for other services is planned.
 - `firelite functions`: checkout-local function worker supervisor. It starts a Node worker, discovers Firebase Functions exports from the watched source directory, proxies emulator-compatible HTTP function URLs, and restarts the worker when source files change.
 - `firelite emulators`: combined local runner for stateful services plus one checkout-local functions worker. Cloud Tasks dispatch is wired directly to that local worker. Stateful listeners open only after the initial Functions worker is ready.
-- `auth`, `storage`, `pubsub`, and `tasks`: in-memory, project-scoped emulator state.
+- `auth`: project-scoped emulator state with optional SQLite user persistence through `--persist`.
+- `storage`, `pubsub`, and `tasks`: in-memory, project-scoped emulator state.
 
 The Functions supervisor monitors both source changes and the Node child process. Unexpected worker exits temporarily mark Functions unhealthy and trigger bounded-backoff restarts. CI runs that do not edit function source can use `--no-reload` to avoid polling the checkout.
 
@@ -33,7 +34,7 @@ Each supported endpoint should have:
 
 ## State
 
-The first Auth implementation is in-memory for fast tests. The durable daemon state layer should be introduced behind service traits after the first contract surface stabilizes. SQLite is the preferred first durable format because it is inspectable, widely available, and supports simple per-project reset transactions.
+Auth is in-memory by default for fast tests. Passing `--persist <FILE>` loads users from SQLite and writes user changes back after Auth requests. Email, phone, and provider indexes are rebuilt from user records at startup. Short-lived verification codes and pending MFA credentials are intentionally not restored. Storage, Pub/Sub, and Tasks remain in-memory.
 
 ## Tracing
 

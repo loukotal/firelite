@@ -3,7 +3,7 @@ use crate::{
 };
 use anyhow::Context;
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::{
         header::{
             ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
@@ -12,11 +12,11 @@ use axum::{
         HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -65,6 +65,24 @@ pub fn app_state_with_functions_for_project(
     })
 }
 
+pub fn app_state_with_functions_for_project_persistent(
+    project_id: impl Into<String>,
+    functions: Option<FunctionsHandle>,
+    persistence_path: PathBuf,
+) -> anyhow::Result<Arc<AppState>> {
+    Ok(Arc::new(AppState {
+        auth: auth::AuthState::persistent(project_id, persistence_path)?,
+        storage: storage::StorageState::default(),
+        pubsub: pubsub::PubsubState::default(),
+        tasks: tasks::TasksState::default(),
+        functions,
+        http_client: reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .expect("valid HTTP client configuration"),
+    }))
+}
+
 pub fn app() -> Router {
     app_with_state(app_state())
 }
@@ -74,17 +92,45 @@ pub fn app_for_project(project_id: impl Into<String>) -> Router {
 }
 
 pub fn app_with_state(state: Arc<AppState>) -> Router {
+    let auth_router = if state.auth.is_persistent() {
+        auth::router().layer(middleware::from_fn_with_state(
+            state.clone(),
+            persist_auth_after_request,
+        ))
+    } else {
+        auth::router()
+    };
     Router::new()
         .route("/", get(root))
         .route("/__/health", get(health))
         .route("/__/ui", get(web_ui::console))
-        .merge(auth::router())
+        .merge(auth_router)
         .merge(storage::router())
         .merge(pubsub::router())
         .merge(tasks::router())
         .fallback(fallback)
         .layer(middleware::from_fn(add_cors_headers))
         .with_state(state)
+}
+
+async fn persist_auth_after_request(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    let auth = state.auth.clone();
+    match tokio::task::spawn_blocking(move || auth.persist()).await {
+        Ok(Ok(())) => response,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "failed to persist Auth state");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Auth persistence task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 pub fn storage_app_with_state(state: Arc<AppState>) -> Router {

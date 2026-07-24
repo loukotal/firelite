@@ -217,6 +217,10 @@ impl PreparedFunctions {
 }
 
 impl FunctionsHandle {
+    pub(crate) fn project_id(&self) -> &str {
+        &self.state.project_id
+    }
+
     pub async fn dispatch_event(
         &self,
         event_type: &str,
@@ -248,7 +252,7 @@ impl FunctionsHandle {
                 event_type,
                 function = %descriptor.entry_id,
                 generation = active.generation,
-                "running storage event"
+                "running background event"
             );
             match self.state.client.post(target).json(event).send().await {
                 Ok(response) if response.status().is_success() => delivered += 1,
@@ -256,13 +260,13 @@ impl FunctionsHandle {
                     event_type,
                     function = %descriptor.entry_id,
                     status = %response.status(),
-                    "storage event handler failed"
+                    "background event handler failed"
                 ),
                 Err(error) => warn!(
                     %error,
                     event_type,
                     function = %descriptor.entry_id,
-                    "storage event dispatch failed"
+                    "background event dispatch failed"
                 ),
             }
         }
@@ -286,7 +290,10 @@ fn event_descriptor_matches(
     let Some(descriptor_type) = descriptor_type.as_deref() else {
         return false;
     };
-    if descriptor_type != event_type && !is_storage_finalize_event(descriptor_type, event_type) {
+    if descriptor_type != event_type
+        && !is_storage_finalize_event(descriptor_type, event_type)
+        && !is_pubsub_publish_event(descriptor_type, event_type)
+    {
         return false;
     }
 
@@ -300,6 +307,8 @@ fn event_descriptor_matches(
         Some(serde_json::Value::String(resource)) => {
             attributes.get("bucket").is_some_and(|bucket| {
                 resource == bucket || resource.ends_with(&format!("/buckets/{bucket}"))
+            }) || attributes.get("topic").is_some_and(|topic| {
+                resource == topic || resource.ends_with(&format!("/topics/{topic}"))
             })
         }
         Some(_) => false,
@@ -310,6 +319,14 @@ fn is_storage_finalize_event(left: &str, right: &str) -> bool {
     const EVENT_TYPES: [&str; 2] = [
         "google.cloud.storage.object.v1.finalized",
         "google.storage.object.finalize",
+    ];
+    EVENT_TYPES.contains(&left) && EVENT_TYPES.contains(&right)
+}
+
+fn is_pubsub_publish_event(left: &str, right: &str) -> bool {
+    const EVENT_TYPES: [&str; 2] = [
+        "google.cloud.pubsub.topic.v1.messagePublished",
+        "google.pubsub.topic.publish",
     ];
     EVENT_TYPES.contains(&left) && EVENT_TYPES.contains(&right)
 }
@@ -1908,6 +1925,235 @@ exports.storage.processLeaseAgreement.__endpoint = {{
         );
 
         storage_server.abort();
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pubsub_publish_dispatches_gen2_message_published_event() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "firelite-pubsub-functions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let captured_path = dir.join("captured-events.jsonl");
+        let captured_path_js = serde_json::to_string(&captured_path.to_string_lossy()).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            &format!(
+                r#"
+const fs = require("node:fs");
+exports.processMessage = async (event) => {{
+  fs.appendFileSync({captured_path_js}, JSON.stringify(event) + "\n");
+}};
+exports.processMessage.__endpoint = {{
+  platform: "gcfv2",
+  id: "processMessage",
+  region: ["us-central1"],
+  eventTrigger: {{
+    eventType: "google.cloud.pubsub.topic.v1.messagePublished",
+    eventFilters: {{ topic: "events" }}
+  }}
+}};
+"#
+            ),
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
+        let functions = FunctionsHandle {
+            state: Arc::new(FunctionsState {
+                project_id: "demo-firelite".to_string(),
+                active: Arc::new(RwLock::new(Some(worker.active.clone()))),
+                client: reqwest::Client::new(),
+            }),
+        };
+        let state =
+            crate::server::app_state_with_functions_for_project("demo-firelite", Some(functions));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let pubsub_server = tokio::spawn(async move {
+            axum::serve(listener, crate::server::pubsub_app_with_state(state))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        client
+            .put(format!(
+                "{base_url}/v1/projects/demo-firelite/topics/events"
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        client
+            .post(format!(
+                "{base_url}/v1/projects/demo-firelite/topics/events:publish"
+            ))
+            .json(&serde_json::json!({
+                "messages": [{
+                    "data": "aGVsbG8=",
+                    "attributes": { "kind": "greeting" },
+                    "orderingKey": "ordered"
+                }]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            while !captured_path.exists() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Pub/Sub event should be delivered");
+
+        let captured = std::fs::read_to_string(&captured_path).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(captured.lines().next().unwrap()).unwrap();
+        assert_eq!(event["specversion"], "1.0");
+        assert_eq!(
+            event["type"],
+            "google.cloud.pubsub.topic.v1.messagePublished"
+        );
+        assert_eq!(
+            event["source"],
+            "//pubsub.googleapis.com/projects/demo-firelite/topics/events"
+        );
+        assert_eq!(event["data"]["message"]["data"], "aGVsbG8=");
+        assert_eq!(event["data"]["message"]["attributes"]["kind"], "greeting");
+        assert_eq!(event["data"]["message"]["orderingKey"], "ordered");
+        assert!(event["data"]["message"]["messageId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert!(event["data"]["message"]["publishTime"]
+            .as_str()
+            .is_some_and(|time| time.ends_with('Z')));
+
+        pubsub_server.abort();
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pubsub_publish_dispatches_gen1_message_and_context() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "firelite-pubsub-gen1-functions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let captured_path = dir.join("captured-events.jsonl");
+        let captured_path_js = serde_json::to_string(&captured_path.to_string_lossy()).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            &format!(
+                r#"
+const fs = require("node:fs");
+exports.processMessage = async (message, context) => {{
+  fs.appendFileSync({captured_path_js}, JSON.stringify({{ message, context }}) + "\n");
+}};
+exports.processMessage.__trigger = {{
+  name: "processMessage",
+  regions: ["us-central1"],
+  eventTrigger: {{
+    eventType: "google.pubsub.topic.publish",
+    resource: "projects/demo-firelite/topics/events"
+  }}
+}};
+"#
+            ),
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
+        let functions = FunctionsHandle {
+            state: Arc::new(FunctionsState {
+                project_id: "demo-firelite".to_string(),
+                active: Arc::new(RwLock::new(Some(worker.active.clone()))),
+                client: reqwest::Client::new(),
+            }),
+        };
+        let state =
+            crate::server::app_state_with_functions_for_project("demo-firelite", Some(functions));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let pubsub_server = tokio::spawn(async move {
+            axum::serve(listener, crate::server::pubsub_app_with_state(state))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        client
+            .put(format!(
+                "{base_url}/v1/projects/demo-firelite/topics/events"
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        client
+            .post(format!(
+                "{base_url}/v1/projects/demo-firelite/topics/events:publish"
+            ))
+            .json(&serde_json::json!({
+                "messages": [{
+                    "data": "aGVsbG8=",
+                    "attributes": { "kind": "greeting" }
+                }]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        timeout(Duration::from_secs(3), async {
+            while !captured_path.exists() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Gen1 Pub/Sub event should be delivered");
+
+        let captured = std::fs::read_to_string(&captured_path).unwrap();
+        let invocation: serde_json::Value =
+            serde_json::from_str(captured.lines().next().unwrap()).unwrap();
+        assert_eq!(invocation["message"]["data"], "aGVsbG8=");
+        assert_eq!(invocation["message"]["attributes"]["kind"], "greeting");
+        assert!(invocation["message"]["messageId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(
+            invocation["context"]["eventType"],
+            "google.pubsub.topic.publish"
+        );
+        assert_eq!(
+            invocation["context"]["resource"]["service"],
+            "pubsub.googleapis.com"
+        );
+        assert_eq!(
+            invocation["context"]["resource"]["name"],
+            "projects/demo-firelite/topics/events"
+        );
+        assert_eq!(
+            invocation["context"]["resource"]["type"],
+            "type.googleapis.com/google.pubsub.v1.PubsubMessage"
+        );
+
+        pubsub_server.abort();
         worker.child.kill().await.unwrap();
     }
 

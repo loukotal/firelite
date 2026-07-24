@@ -480,7 +480,7 @@ fn publish_messages(
         .write()
         .expect("pubsub state poisoned");
     let project = if create_topic_if_missing {
-        projects.entry(project_id).or_default()
+        projects.entry(project_id.clone()).or_default()
     } else {
         projects
             .get_mut(&project_id)
@@ -497,14 +497,16 @@ fn publish_messages(
     }
 
     let mut message_ids = Vec::with_capacity(messages.len());
+    let mut published_messages = Vec::with_capacity(messages.len());
     for input in messages {
         project.next_message_id += 1;
         let message_id = project.next_message_id.to_string();
+        let publish_time = now_ms();
         let message = PubsubMessage {
             data: input.data,
             attributes: input.attributes,
             message_id: message_id.clone(),
-            publish_time: now_ms().to_string(),
+            publish_time: format_timestamp_ms(publish_time),
             ordering_key: input.ordering_key,
         };
 
@@ -513,10 +515,57 @@ fn publish_messages(
                 subscription.pending.push_back(message.clone());
             }
         }
+        published_messages.push(message);
         message_ids.push(message_id);
     }
+    drop(projects);
+
+    dispatch_published_messages(&state, &project_id, &topic_name, published_messages);
 
     Ok(PublishResponse { message_ids })
+}
+
+fn dispatch_published_messages(
+    state: &SharedState,
+    project_id: &str,
+    topic_name: &str,
+    messages: Vec<PubsubMessage>,
+) {
+    let Some(functions) = state.functions.clone() else {
+        return;
+    };
+    if functions.project_id() != project_id {
+        return;
+    }
+    let Some(topic) = topic_name.rsplit('/').next() else {
+        return;
+    };
+    let attributes = HashMap::from([("topic".to_string(), topic.to_string())]);
+    let source = format!("//pubsub.googleapis.com/{topic_name}");
+    let event_type = "google.cloud.pubsub.topic.v1.messagePublished";
+
+    for message in messages {
+        let event = serde_json::json!({
+            "specversion": "1.0",
+            "id": message.message_id,
+            "source": source,
+            "type": event_type,
+            "time": message.publish_time,
+            "datacontenttype": "application/json",
+            "data": {
+                "message": message,
+            }
+        });
+        let functions = functions.clone();
+        let attributes = attributes.clone();
+        let project_id = project_id.to_string();
+        tokio::spawn(async move {
+            let delivered = functions
+                .dispatch_event(event_type, &attributes, &event)
+                .await;
+            tracing::debug!(project = %project_id, delivered, "Pub/Sub event dispatch complete");
+        });
+    }
 }
 
 async fn create_subscription(
@@ -819,6 +868,33 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_millis() as u64
+}
+
+fn format_timestamp_ms(timestamp_ms: u64) -> String {
+    let seconds = timestamp_ms / 1_000;
+    let milliseconds = timestamp_ms % 1_000;
+    let days = (seconds / 86_400) as i64;
+    let seconds_in_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_in_day / 3_600;
+    let minute = (seconds_in_day % 3_600) / 60;
+    let second = seconds_in_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milliseconds:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month as u64, day as u64)
 }
 
 fn error(status: StatusCode, message: &'static str) -> PubsubError {

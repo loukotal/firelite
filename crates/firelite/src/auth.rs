@@ -207,6 +207,7 @@ struct ProjectAuthState {
     user_ids_by_provider: HashMap<(String, String), String>,
     oob_codes: HashMap<String, OobCodeRecord>,
     verification_codes: HashMap<String, VerificationCodeRecord>,
+    next_verification_code_sequence: u64,
     mfa_pending_credentials: HashMap<String, MfaPendingCredential>,
 }
 
@@ -294,6 +295,7 @@ struct OobCodeRecord {
 struct VerificationCodeRecord {
     phone_number: String,
     code: String,
+    sequence: u64,
     purpose: VerificationPurpose,
 }
 
@@ -453,6 +455,7 @@ struct AdminCreateRequest {
 #[serde(rename_all = "camelCase")]
 struct AdminUpdateRequest {
     local_id: String,
+    password: Option<String>,
     display_name: Option<String>,
     photo_url: Option<String>,
     phone_number: Option<String>,
@@ -1033,6 +1036,10 @@ fn admin_update_user(
     }
     if let Some(photo_url) = payload.photo_url {
         record.photo_url = Some(photo_url);
+    }
+    if let Some(password) = payload.password {
+        record.password_hash = Some(hash_password(&password));
+        record.valid_since_secs = now_secs();
     }
     if let Some(phone_number) = payload.phone_number {
         if let Some(old_phone_number) = record.phone_number.replace(phone_number.clone()) {
@@ -1741,15 +1748,22 @@ async fn list_verification_codes(
     let verification_codes = projects
         .get(&project_id)
         .map(|project| {
-            project
+            let mut codes = project
                 .verification_codes
                 .iter()
-                .map(|(session_info, record)| EmulatorVerificationCode {
-                    phone_number: record.phone_number.clone(),
-                    session_info: session_info.clone(),
-                    code: record.code.clone(),
+                .map(|(session_info, record)| {
+                    (
+                        record.sequence,
+                        EmulatorVerificationCode {
+                            phone_number: record.phone_number.clone(),
+                            session_info: session_info.clone(),
+                            code: record.code.clone(),
+                        },
+                    )
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            codes.sort_by_key(|(sequence, _)| *sequence);
+            codes.into_iter().map(|(_, code)| code).collect()
         })
         .unwrap_or_default();
     Ok(Json(ListVerificationCodesResponse { verification_codes }))
@@ -2287,11 +2301,13 @@ fn create_verification_code(
     hasher.update(session_info.as_bytes());
     let digest = hasher.finalize();
     let number = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    project.next_verification_code_sequence += 1;
     project.verification_codes.insert(
         session_info.clone(),
         VerificationCodeRecord {
             phone_number,
             code: format!("{number:06}"),
+            sequence: project.next_verification_code_sequence,
             purpose,
         },
     );

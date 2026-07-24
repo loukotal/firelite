@@ -93,7 +93,7 @@ cargo run -p firelite -- \
 
 Pass `--filter` to run only selected Cloud Functions exports/names. It can be repeated, for example `--filter api --filter e2e`.
 
-Pub/Sub accepts HTTP/JSON emulator calls at `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` for topic/subscription create, publish, pull, and acknowledge flows.
+Pub/Sub accepts HTTP/JSON emulator calls at `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` for topic/subscription create, publish, pull, and acknowledge flows. In `firelite emulators`, publishing also asynchronously invokes matching Gen 1 and Gen 2 Pub/Sub functions; this background dispatch does not require a subscription.
 
 Cloud Tasks accepts Firebase Admin SDK task queue `createTask` calls at `CLOUD_TASKS_EMULATOR_HOST=127.0.0.1:9899`. In `firelite emulators`, enqueued task queue requests are dispatched directly to the checkout-local functions worker when the filter matches the queue/function name. In the basic implementation, dispatch is synchronous and runs before the create-task response returns. Dispatch targets are intentionally limited to local `http://` URLs so the runtime does not carry a TLS stack.
 

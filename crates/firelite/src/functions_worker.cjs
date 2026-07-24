@@ -83,15 +83,19 @@ async function main() {
 async function invokeHandler(req, res, handler, descriptor) {
   if (descriptor.trigger.type === "event") {
     const event = await readJsonBody(req);
+    const isPubsub = descriptor.trigger.eventType === "google.pubsub.topic.publish";
+    const resourceName = isPubsub
+      ? event.source.replace(/^\/\/pubsub\.googleapis\.com\//, "")
+      : `projects/_/buckets/${event.data.bucket}/objects/${event.data.name}`;
     const result = descriptor.generation === "gen1"
-      ? handler(event.data, {
+      ? handler(isPubsub ? event.data.message : event.data, {
           eventId: event.id,
           timestamp: event.time,
           eventType: descriptor.trigger.eventType,
           resource: {
-            service: "storage.googleapis.com",
-            name: `projects/_/buckets/${event.data.bucket}/objects/${event.data.name}`,
-            type: "storage#object",
+            service: isPubsub ? "pubsub.googleapis.com" : "storage.googleapis.com",
+            name: resourceName,
+            type: isPubsub ? "type.googleapis.com/google.pubsub.v1.PubsubMessage" : "storage#object",
           },
           params: {},
         })

@@ -214,6 +214,28 @@ async fn auth_phone_mfa_enrollment_and_sign_in_flow() {
     let enrollment_session = enrollment_started["phoneSessionInfo"]["sessionInfo"]
         .as_str()
         .unwrap();
+    let enrollment_retried: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v2/accounts/mfaEnrollment:start?key=fake"
+        ))
+        .json(&json!({
+            "idToken": created["idToken"],
+            "phoneEnrollmentInfo": {
+                "phoneNumber": "+15555550123",
+                "clientType": "CLIENT_TYPE_WEB"
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let enrollment_retry_session = enrollment_retried["phoneSessionInfo"]["sessionInfo"]
+        .as_str()
+        .unwrap();
     let enrollment_codes: Value = client
         .get(format!(
             "{base_url}/emulator/v1/projects/demo-firelite/verificationCodes"
@@ -231,7 +253,7 @@ async fn auth_phone_mfa_enrollment_and_sign_in_flow() {
             .as_array()
             .unwrap()
             .len(),
-        1
+        2
     );
     assert_eq!(
         enrollment_codes["verificationCodes"][0]["sessionInfo"],
@@ -241,7 +263,11 @@ async fn auth_phone_mfa_enrollment_and_sign_in_flow() {
         enrollment_codes["verificationCodes"][0]["phoneNumber"],
         "+15555550123"
     );
-    let enrollment_code = enrollment_codes["verificationCodes"][0]["code"]
+    assert_eq!(
+        enrollment_codes["verificationCodes"][1]["sessionInfo"],
+        enrollment_retry_session
+    );
+    let enrollment_code = enrollment_codes["verificationCodes"][1]["code"]
         .as_str()
         .unwrap();
 
@@ -253,7 +279,7 @@ async fn auth_phone_mfa_enrollment_and_sign_in_flow() {
             "idToken": created["idToken"],
             "displayName": "Personal phone",
             "phoneVerificationInfo": {
-                "sessionInfo": enrollment_session,
+                "sessionInfo": enrollment_retry_session,
                 "code": enrollment_code
             }
         }))
@@ -350,9 +376,13 @@ async fn auth_phone_mfa_enrollment_and_sign_in_flow() {
         .unwrap();
     assert_eq!(
         sign_in_codes["verificationCodes"].as_array().unwrap().len(),
-        1
+        2
     );
-    let sign_in_code = sign_in_codes["verificationCodes"][0]["code"]
+    assert_eq!(
+        sign_in_codes["verificationCodes"][1]["sessionInfo"],
+        sign_in_session
+    );
+    let sign_in_code = sign_in_codes["verificationCodes"][1]["code"]
         .as_str()
         .unwrap();
 
@@ -703,6 +733,119 @@ async fn auth_admin_update_custom_claims_are_in_new_id_tokens() {
     assert_eq!(token_payload["admin"], true);
     assert_eq!(token_payload["superadmin"], true);
     assert_eq!(token_payload["partner"], "admin");
+}
+
+#[tokio::test]
+async fn auth_admin_update_changes_password() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "email": "updated-password@example.test",
+            "password": "old-password"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let signed_in_before_update: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "updated-password@example.test",
+            "password": "old-password",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "localId": created["localId"].as_str().unwrap(),
+            "password": "new-password"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let old_token = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=fake"
+        ))
+        .json(&json!({ "idToken": signed_in_before_update["idToken"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_token.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let old_refresh_token = client
+        .post(format!(
+            "{base_url}/securetoken.googleapis.com/v1/token?key=fake"
+        ))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                signed_in_before_update["refreshToken"]
+                    .as_str()
+                    .expect("refresh token"),
+            ),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_refresh_token.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let old_password = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "updated-password@example.test",
+            "password": "old-password",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_password.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=fake"
+        ))
+        .json(&json!({
+            "email": "updated-password@example.test",
+            "password": "new-password",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 }
 
 #[tokio::test]

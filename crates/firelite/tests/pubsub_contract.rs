@@ -1,7 +1,13 @@
-use firelite::server;
+use firelite::{
+    functions::{self, FunctionsConfig},
+    server,
+};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    time::{sleep, timeout, Duration},
+};
 
 #[tokio::test]
 async fn pubsub_topic_subscription_publish_pull_ack_flow() {
@@ -286,11 +292,222 @@ async fn pubsub_grpc_publish_auto_creates_missing_topic() {
     assert_eq!(topic["name"], "projects/demo-firelite/topics/auto-created");
 }
 
+#[tokio::test]
+async fn pubsub_publish_dispatches_gen1_and_gen2_function_event_shapes() {
+    let dir =
+        std::env::temp_dir().join(format!("firelite-pubsub-contract-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gen1_path = dir.join("gen1.json");
+    let gen2_path = dir.join("gen2.json");
+    let gen1_path_js = serde_json::to_string(&gen1_path.to_string_lossy()).unwrap();
+    let gen2_path_js = serde_json::to_string(&gen2_path.to_string_lossy()).unwrap();
+    std::fs::write(
+        dir.join("index.js"),
+        format!(
+            r#"
+const fs = require("node:fs");
+exports.gen1 = async (message, context) => {{
+  fs.appendFileSync({gen1_path_js}, JSON.stringify({{ message, context }}) + "\n");
+}};
+exports.gen1.__trigger = {{
+  name: "gen1",
+  eventTrigger: {{
+    eventType: "google.pubsub.topic.publish",
+    resource: "projects/demo-firelite/topics/events"
+  }}
+}};
+exports.gen2 = async (event) => {{
+  fs.appendFileSync({gen2_path_js}, JSON.stringify(event) + "\n");
+}};
+exports.gen2.__endpoint = {{
+  platform: "gcfv2",
+  id: "gen2",
+  eventTrigger: {{
+    eventType: "google.cloud.pubsub.topic.v1.messagePublished",
+    eventFilters: {{ topic: "events" }}
+  }}
+}};
+"#
+        ),
+    )
+    .unwrap();
+    let functions_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let functions_addr = functions_listener.local_addr().unwrap();
+    drop(functions_listener);
+    let prepared = functions::prepare(FunctionsConfig {
+        project_id: "demo-firelite".to_string(),
+        source_dir: dir,
+        addr: functions_addr,
+        filters: Vec::new(),
+        reload_on_change: false,
+    })
+    .await
+    .unwrap();
+    let state =
+        server::app_state_with_functions_for_project("demo-firelite", Some(prepared.handle()));
+    let base_url = spawn_app_with_state(state).await;
+    let client = reqwest::Client::new();
+
+    client
+        .put(format!(
+            "{base_url}/v1/projects/demo-firelite/topics/events"
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!(
+            "{base_url}/v1/projects/demo-firelite/topics/events:publish"
+        ))
+        .json(&json!({
+            "messages": [{
+                "data": "aGVsbG8=",
+                "attributes": { "kind": "greeting" },
+                "orderingKey": "ordered"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    timeout(Duration::from_secs(3), async {
+        while !gen1_path.exists() || !gen2_path.exists() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both Pub/Sub functions should receive the event");
+
+    let gen1: Value = serde_json::from_slice(&std::fs::read(&gen1_path).unwrap()).unwrap();
+    assert_eq!(gen1["message"]["data"], "aGVsbG8=");
+    assert_eq!(gen1["message"]["attributes"]["kind"], "greeting");
+    assert_eq!(gen1["message"]["orderingKey"], "ordered");
+    assert_eq!(gen1["context"]["eventType"], "google.pubsub.topic.publish");
+    assert_eq!(
+        gen1["context"]["resource"]["name"],
+        "projects/demo-firelite/topics/events"
+    );
+
+    let gen2: Value = serde_json::from_slice(&std::fs::read(&gen2_path).unwrap()).unwrap();
+    assert_eq!(
+        gen2["type"],
+        "google.cloud.pubsub.topic.v1.messagePublished"
+    );
+    assert_eq!(
+        gen2["source"],
+        "//pubsub.googleapis.com/projects/demo-firelite/topics/events"
+    );
+    assert_eq!(gen2["data"]["message"]["data"], "aGVsbG8=");
+    assert_eq!(gen2["data"]["message"]["orderingKey"], "ordered");
+    assert_eq!(
+        gen1["message"]["messageId"],
+        gen2["data"]["message"]["messageId"]
+    );
+    assert_eq!(
+        gen1["message"]["publishTime"],
+        gen2["data"]["message"]["publishTime"]
+    );
+
+    client
+        .post(format!("{base_url}/google.pubsub.v1.Publisher/Publish"))
+        .header("content-type", "application/grpc")
+        .body(grpc_frame(publish_request_message(
+            "projects/demo-firelite/topics/events",
+            b"grpc",
+            &[],
+        )))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        while std::fs::read_to_string(&gen1_path).unwrap().lines().count() < 2
+            || std::fs::read_to_string(&gen2_path).unwrap().lines().count() < 2
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("gRPC publish should dispatch both functions");
+
+    client
+        .post(format!("{base_url}/google.pubsub.v1.Publisher/Publish"))
+        .header("content-type", "application/grpc")
+        .body(grpc_frame(publish_request_message(
+            "projects/other-project/topics/events",
+            b"ignored",
+            &[],
+        )))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        std::fs::read_to_string(&gen1_path).unwrap().lines().count(),
+        2
+    );
+    assert_eq!(
+        std::fs::read_to_string(&gen2_path).unwrap().lines().count(),
+        2
+    );
+
+    client
+        .put(format!(
+            "{base_url}/v1/projects/demo-firelite/topics/other-events"
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!(
+            "{base_url}/v1/projects/demo-firelite/topics/other-events:publish"
+        ))
+        .json(&json!({ "messages": [{ "data": "aWdub3JlZA==" }] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        std::fs::read_to_string(gen1_path).unwrap().lines().count(),
+        2
+    );
+    assert_eq!(
+        std::fs::read_to_string(gen2_path).unwrap().lines().count(),
+        2
+    );
+
+    drop(prepared);
+}
+
 async fn spawn_app() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, server::app()).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_app_with_state(state: std::sync::Arc<server::AppState>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, server::pubsub_app_with_state(state))
+            .await
+            .unwrap();
     });
     format!("http://{addr}")
 }

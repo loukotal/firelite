@@ -1236,10 +1236,16 @@ fn sign_in_with_phone_number(
     record.last_login_at_ms = Some(now_ms());
     let include_token = payload.return_secure_token.unwrap_or(true);
     let response = json!({
-        "idToken": include_token.then(|| make_token(&project_id, record)).unwrap_or_default(),
-        "refreshToken": include_token
-            .then(|| make_refresh_token(&project_id, &local_id))
-            .unwrap_or_default(),
+        "idToken": if include_token {
+            make_token(&project_id, record)
+        } else {
+            String::default()
+        },
+        "refreshToken": if include_token {
+            make_refresh_token(&project_id, &local_id)
+        } else {
+            String::default()
+        },
         "expiresIn": "3600",
         "localId": local_id,
         "isNewUser": is_new_user,

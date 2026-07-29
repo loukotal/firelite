@@ -1308,6 +1308,88 @@ async fn auth_recaptcha_discovery_and_mfa_codes_use_configured_project() {
 }
 
 #[tokio::test]
+async fn auth_first_factor_phone_code_signs_in_and_is_single_use() {
+    let base_url = spawn_app_for_project("demo-phone").await;
+    let client = reqwest::Client::new();
+
+    let sent: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:sendVerificationCode?key=fake"
+        ))
+        .json(&json!({
+            "phoneNumber": "+15555550124",
+            "recaptchaToken": "emulator-token",
+            "clientType": "CLIENT_TYPE_WEB"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_info = sent["sessionInfo"].as_str().unwrap();
+
+    let codes: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-phone/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let verification = codes["verificationCodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|code| code["sessionInfo"] == session_info)
+        .unwrap();
+    let code = verification["code"].as_str().unwrap();
+
+    let signed_in: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPhoneNumber?key=fake"
+        ))
+        .json(&json!({
+            "sessionInfo": session_info,
+            "code": code,
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(signed_in["phoneNumber"], "+15555550124");
+    assert_eq!(signed_in["isNewUser"], true);
+    assert!(signed_in["idToken"].as_str().unwrap().contains('.'));
+
+    let reused = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPhoneNumber?key=fake"
+        ))
+        .json(&json!({
+            "sessionInfo": session_info,
+            "code": code,
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), StatusCode::BAD_REQUEST);
+    let reused_body: Value = reused.json().await.unwrap();
+    assert_eq!(reused_body["error"]["message"], "INVALID_SESSION_INFO");
+}
+
+#[tokio::test]
 async fn auth_duplicate_email_matches_emulator_error_shape() {
     let base_url = spawn_app().await;
     let client = reqwest::Client::new();

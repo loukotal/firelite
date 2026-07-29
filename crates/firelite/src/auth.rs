@@ -301,6 +301,7 @@ struct VerificationCodeRecord {
 
 #[derive(Debug, Clone)]
 enum VerificationPurpose {
+    FirstFactorSignIn,
     Enrollment {
         local_id: String,
     },
@@ -330,6 +331,20 @@ struct SignUpRequest {
 struct SignInRequest {
     email: String,
     password: String,
+    return_secure_token: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendVerificationCodeRequest {
+    phone_number: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PhoneSignInRequest {
+    session_info: String,
+    code: String,
     return_secure_token: Option<bool>,
 }
 
@@ -726,6 +741,14 @@ async fn identity_action(
         "accounts:signInWithPassword" => {
             let payload = parse_payload(payload)?;
             Ok(sign_in_with_password(&state, payload)?)
+        }
+        "accounts:sendVerificationCode" => {
+            let payload = parse_payload(payload)?;
+            Ok(send_verification_code(&state, payload)?)
+        }
+        "accounts:signInWithPhoneNumber" => {
+            let payload = parse_payload(payload)?;
+            Ok(sign_in_with_phone_number(&state, payload)?)
         }
         "accounts:lookup" => {
             let payload = parse_payload(payload)?;
@@ -1124,6 +1147,106 @@ fn sign_in_with_password(
         payload.return_secure_token,
     ))
     .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"))
+}
+
+fn send_verification_code(
+    state: &SharedState,
+    payload: SendVerificationCodeRequest,
+) -> Result<serde_json::Value, AuthError> {
+    if !is_valid_phone_number(&payload.phone_number) {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_PHONE_NUMBER"));
+    }
+    let project_id = state.auth.default_project_id().to_string();
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects.entry(project_id).or_default();
+    let session_info = create_verification_code(
+        project,
+        payload.phone_number,
+        VerificationPurpose::FirstFactorSignIn,
+    );
+    Ok(json!({ "sessionInfo": session_info }))
+}
+
+fn sign_in_with_phone_number(
+    state: &SharedState,
+    payload: PhoneSignInRequest,
+) -> Result<serde_json::Value, AuthError> {
+    let project_id = state.auth.default_project_id().to_string();
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects
+        .get_mut(&project_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"))?;
+    let verification = project
+        .verification_codes
+        .get(&payload.session_info)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"))?;
+    if !matches!(verification.purpose, VerificationPurpose::FirstFactorSignIn) {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"));
+    }
+    if verification.code != payload.code {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_CODE"));
+    }
+
+    let existing_local_id = project
+        .user_ids_by_phone
+        .get(&verification.phone_number)
+        .cloned();
+    let is_new_user = existing_local_id.is_none();
+    let local_id = existing_local_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if is_new_user {
+        let now = now_ms();
+        let record = UserRecord {
+            local_id: local_id.clone(),
+            email: String::new(),
+            display_name: None,
+            photo_url: None,
+            phone_number: Some(verification.phone_number.clone()),
+            custom_attributes: None,
+            disabled: false,
+            email_verified: false,
+            password_hash: None,
+            valid_since_secs: now / 1000,
+            mfa_info: Vec::new(),
+            providers: vec![ProviderRecord {
+                provider_id: "phone".to_string(),
+                raw_id: verification.phone_number.clone(),
+                email: String::new(),
+            }],
+            created_at_ms: now,
+            last_login_at_ms: None,
+        };
+        project
+            .user_ids_by_phone
+            .insert(verification.phone_number.clone(), local_id.clone());
+        project.user_ids_by_provider.insert(
+            ("phone".to_string(), verification.phone_number.clone()),
+            local_id.clone(),
+        );
+        project.users_by_id.insert(local_id.clone(), record);
+    }
+
+    let record = project
+        .users_by_id
+        .get_mut(&local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if record.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    record.last_login_at_ms = Some(now_ms());
+    let include_token = payload.return_secure_token.unwrap_or(true);
+    let response = json!({
+        "idToken": include_token.then(|| make_token(&project_id, record)).unwrap_or_default(),
+        "refreshToken": include_token
+            .then(|| make_refresh_token(&project_id, &local_id))
+            .unwrap_or_default(),
+        "expiresIn": "3600",
+        "localId": local_id,
+        "isNewUser": is_new_user,
+        "phoneNumber": verification.phone_number,
+    });
+    project.verification_codes.remove(&payload.session_info);
+    Ok(response)
 }
 
 fn start_mfa_enrollment(
@@ -1796,6 +1919,7 @@ fn delete_account(auth: &AuthState, project_id: &str, local_id: &str) -> Result<
     project
         .verification_codes
         .retain(|_, verification| match &verification.purpose {
+            VerificationPurpose::FirstFactorSignIn => true,
             VerificationPurpose::Enrollment {
                 local_id: verification_user,
             }

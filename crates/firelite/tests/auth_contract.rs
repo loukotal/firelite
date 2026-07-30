@@ -1456,7 +1456,7 @@ async fn auth_custom_token_sign_in_creates_local_user() {
 }
 
 #[tokio::test]
-async fn auth_phone_credential_update_links_the_authenticated_user() {
+async fn auth_phone_credential_link_preserves_the_authenticated_user() {
     let base_url = spawn_app().await;
     let client = reqwest::Client::new();
 
@@ -1530,11 +1530,12 @@ async fn auth_phone_credential_update_links_the_authenticated_user() {
 
     let updated: Value = client
         .post(format!(
-            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:update?key=fake"
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithPhoneNumber?key=fake"
         ))
         .json(&json!({
             "idToken": created["idToken"],
-            "phoneVerificationInfo": { "sessionInfo": session_info, "code": code },
+            "sessionInfo": session_info,
+            "code": code,
             "returnSecureToken": true
         }))
         .send()

@@ -345,6 +345,7 @@ struct SendVerificationCodeRequest {
 struct PhoneSignInRequest {
     session_info: String,
     code: String,
+    id_token: Option<String>,
     return_secure_token: Option<bool>,
 }
 
@@ -1196,6 +1197,65 @@ fn sign_in_with_phone_number(
     }
     if verification.code != payload.code {
         return Err(error(StatusCode::BAD_REQUEST, "INVALID_CODE"));
+    }
+
+    if let Some(id_token) = payload.id_token.as_deref() {
+        let claims = parse_client_token_claims(&state.auth, id_token)?;
+        if claims.project_id != project_id {
+            return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
+        }
+        validate_phone_number_available(project, &verification.phone_number, Some(&claims.local_id))?;
+        let phone_number = verification.phone_number;
+        let (local_id, email, old_phone_number, id_token) = {
+            let user = project
+                .users_by_id
+                .get_mut(&claims.local_id)
+                .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+            if user.disabled {
+                return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+            }
+            if claims.issued_at < user.valid_since_secs {
+                return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+            }
+            let old_phone_number = user.phone_number.replace(phone_number.clone());
+            upsert_phone_provider(user, &phone_number);
+            user.last_login_at_ms = Some(now_ms());
+            (
+                user.local_id.clone(),
+                user.email.clone(),
+                old_phone_number,
+                make_token(&project_id, user),
+            )
+        };
+        if let Some(old_phone_number) = old_phone_number {
+            project.user_ids_by_phone.remove(&old_phone_number);
+            project
+                .user_ids_by_provider
+                .remove(&("phone".to_string(), old_phone_number));
+        }
+        project
+            .user_ids_by_phone
+            .insert(phone_number.clone(), local_id.clone());
+        project.user_ids_by_provider.insert(
+            ("phone".to_string(), phone_number.clone()),
+            local_id.clone(),
+        );
+        project.verification_codes.remove(&payload.session_info);
+
+        let include_token = payload.return_secure_token.unwrap_or(true);
+        return Ok(json!({
+            "idToken": if include_token { id_token } else { String::default() },
+            "refreshToken": if include_token {
+                make_refresh_token(&project_id, &local_id)
+            } else {
+                String::default()
+            },
+            "expiresIn": "3600",
+            "localId": local_id,
+            "email": email,
+            "phoneNumber": phone_number,
+            "isNewUser": false,
+        }));
     }
 
     let existing_local_id = project

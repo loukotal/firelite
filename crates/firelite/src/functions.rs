@@ -15,7 +15,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, BufReader},
@@ -24,7 +24,7 @@ use tokio::{
     sync::{mpsc, RwLock},
     time::{sleep, timeout, Duration},
 };
-use tracing::{error, event, info, warn, Level};
+use tracing::{debug, error, event, info, warn, Level};
 
 #[derive(Debug, Clone)]
 pub struct FunctionsConfig {
@@ -357,10 +357,21 @@ async fn proxy_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match proxy_request_inner(state, uri.path(), uri.query(), method, headers, body).await {
-        Ok(response) => response,
-        Err(response) => response,
-    }
+    let path = uri.path().to_owned();
+    let started = Instant::now();
+    let response =
+        match proxy_request_inner(state, &path, uri.query(), method.clone(), headers, body).await {
+            Ok(response) => response,
+            Err(response) => response,
+        };
+    debug!(
+        %method,
+        %path,
+        status = %response.status(),
+        duration_ms = started.elapsed().as_millis(),
+        "function request complete"
+    );
+    response
 }
 
 async fn proxy_request_inner(
@@ -844,19 +855,19 @@ fn log_worker_line(line: &str, fallback_level: Level) {
 
     match formatted.level {
         Level::ERROR => {
-            event!(target: "firelite_worker", Level::ERROR, worker_message = message.as_str())
+            event!(target: "firelite::functions::worker", Level::ERROR, worker_message = message.as_str())
         }
         Level::WARN => {
-            event!(target: "firelite_worker", Level::WARN, worker_message = message.as_str())
+            event!(target: "firelite::functions::worker", Level::WARN, worker_message = message.as_str())
         }
         Level::INFO => {
-            event!(target: "firelite_worker", Level::INFO, worker_message = message.as_str())
+            event!(target: "firelite::functions::worker", Level::INFO, worker_message = message.as_str())
         }
         Level::DEBUG => {
-            event!(target: "firelite_worker", Level::DEBUG, worker_message = message.as_str())
+            event!(target: "firelite::functions::worker", Level::DEBUG, worker_message = message.as_str())
         }
         Level::TRACE => {
-            event!(target: "firelite_worker", Level::TRACE, worker_message = message.as_str())
+            event!(target: "firelite::functions::worker", Level::TRACE, worker_message = message.as_str())
         }
     }
 }

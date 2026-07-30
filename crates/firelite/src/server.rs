@@ -16,9 +16,13 @@ use axum::{
     routing::get,
     Router,
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -110,6 +114,7 @@ pub fn app_with_state(state: Arc<AppState>) -> Router {
         .merge(tasks::router())
         .fallback(fallback)
         .layer(middleware::from_fn(add_cors_headers))
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
 
@@ -140,6 +145,7 @@ pub fn storage_app_with_state(state: Arc<AppState>) -> Router {
         .merge(storage::router())
         .fallback(fallback)
         .layer(middleware::from_fn(add_cors_headers))
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
 
@@ -150,6 +156,7 @@ pub fn tasks_app_with_state(state: Arc<AppState>) -> Router {
         .merge(tasks::router())
         .fallback(fallback)
         .layer(middleware::from_fn(add_cors_headers))
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
 
@@ -160,6 +167,7 @@ pub fn pubsub_app_with_state(state: Arc<AppState>) -> Router {
         .merge(pubsub::router())
         .fallback(fallback)
         .layer(middleware::from_fn(add_cors_headers))
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
 
@@ -269,6 +277,21 @@ async fn add_cors_headers(request: Request, next: Next) -> Response {
         HeaderValue::from_static(
             "x-goog-upload-status,x-goog-upload-url,x-goog-upload-size-received",
         ),
+    );
+    response
+}
+
+async fn log_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    debug!(
+        %method,
+        %path,
+        status = %response.status(),
+        duration_ms = started.elapsed().as_millis(),
+        "request complete"
     );
     response
 }

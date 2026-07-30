@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use firelite::{config::DaemonConfig, functions::FunctionsConfig, server, tasks::FunctionsTarget};
 use std::{fmt, io::IsTerminal, net::SocketAddr, path::PathBuf};
-use tracing::{field::Visit, Event, Level, Subscriber};
+use tracing::{field::Visit, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{
         format::{FormatEvent, FormatFields, Writer},
@@ -10,6 +10,7 @@ use tracing_subscriber::{
         FmtContext,
     },
     registry::LookupSpan,
+    EnvFilter,
 };
 
 #[derive(Debug, Parser)]
@@ -222,15 +223,13 @@ fn resolve_project(project: Option<String>) -> String {
 }
 
 fn init_tracing() {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|value| parse_log_level(&value))
-        .unwrap_or(Level::INFO);
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("firelite=info"));
     tracing_subscriber::fmt()
         .event_format(CompactLogFormatter {
             color: terminal_colors_enabled(),
         })
-        .with_max_level(level)
+        .with_env_filter(filter)
         .init();
 }
 
@@ -258,7 +257,7 @@ where
         }
         writer.write_char(' ')?;
 
-        if event.metadata().target() == "firelite_worker" {
+        if event.metadata().target() == "firelite::functions::worker" {
             let mut visitor = WorkerMessageVisitor::default();
             event.record(&mut visitor);
             if let Some(message) = visitor.message {
@@ -299,37 +298,5 @@ impl Visit for WorkerMessageVisitor {
         if field.name() == "worker_message" && self.message.is_none() {
             self.message = Some(format!("{value:?}"));
         }
-    }
-}
-
-fn parse_log_level(value: &str) -> Option<Level> {
-    let mut global = None;
-    let mut firelite = None;
-
-    for directive in value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        match directive.split_once('=') {
-            Some((target, level)) if target.trim() == "firelite" => {
-                firelite = level_from_str(level);
-            }
-            None => global = level_from_str(directive),
-            _ => {}
-        }
-    }
-
-    firelite.or(global)
-}
-
-fn level_from_str(value: &str) -> Option<Level> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "trace" => Some(Level::TRACE),
-        "debug" => Some(Level::DEBUG),
-        "info" => Some(Level::INFO),
-        "warn" => Some(Level::WARN),
-        "error" => Some(Level::ERROR),
-        _ => None,
     }
 }

@@ -667,23 +667,21 @@ async fn recaptcha_params() -> Json<serde_json::Value> {
     }))
 }
 
-async fn recaptcha_config() -> Response {
-    let message = "identitytoolkit.getRecaptchaConfig is not implemented in the Auth Emulator.";
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": {
-                "code": 501,
-                "message": message,
-                "errors": [{
-                    "message": message,
-                    "reason": "unimplemented"
-                }],
-                "status": "NOT_IMPLEMENTED"
+async fn recaptcha_config() -> Json<serde_json::Value> {
+    Json(json!({
+        "kind": "identitytoolkit#GetRecaptchaConfigResponse",
+        "recaptchaKey": "Fake-key__Do-not-send-this-to-Recaptcha_",
+        "recaptchaEnforcementState": [
+            {
+                "provider": "PHONE_PROVIDER",
+                "enforcementState": "OFF"
+            },
+            {
+                "provider": "EMAIL_PASSWORD_PROVIDER",
+                "enforcementState": "OFF"
             }
-        })),
-    )
-        .into_response()
+        ]
+    }))
 }
 
 async fn refresh_secure_token(

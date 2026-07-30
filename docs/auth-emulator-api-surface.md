@@ -28,7 +28,7 @@ This tracks the `firebase/auth` client APIs currently used by the app and the em
 | `PhoneAuthProvider.verifyPhoneNumber` | `accounts:sendVerificationCode` and `accounts:signInWithPhoneNumber` | implemented | Generates inspectable, single-use SMS codes exposed by `/emulator/v1/projects/{project}/verificationCodes`. |
 | `multiFactor` phone enrollment | v2 `accounts/mfaEnrollment:start` and `accounts/mfaEnrollment:finalize` | implemented | Uses inspectable, single-use emulator SMS codes and persists factors in `mfaInfo`. |
 | `getMultiFactorResolver` phone sign-in | Password first factor plus v2 `accounts/mfaSignIn:start` and `accounts/mfaSignIn:finalize` | implemented | Password login returns `mfaPendingCredential`; completed and refreshed tokens retain phone second-factor claims. |
-| `RecaptchaVerifier` emulator discovery | v2 `recaptchaConfig` fallback and v1 `recaptchaParams` | implemented | Returns the same Enterprise 501 fallback and fake v2 site key/token as firebase-tools 13.35.1. |
+| `RecaptchaVerifier` emulator discovery | v2 `recaptchaConfig` and v1 `recaptchaParams` | implemented | Returns the fake emulator site key with phone and email/password enforcement disabled. |
 
 ## Implementation notes
 

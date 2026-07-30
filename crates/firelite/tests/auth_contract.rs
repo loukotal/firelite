@@ -1192,20 +1192,32 @@ async fn auth_recaptcha_discovery_and_mfa_codes_use_configured_project() {
     let base_url = spawn_app_for_project("bf-demo-a24dc").await;
     let client = reqwest::Client::new();
 
-    let enterprise = client
+    let enterprise: Value = client
         .get(format!(
             "{base_url}/identitytoolkit.googleapis.com/v2/recaptchaConfig?key=fake&clientType=CLIENT_TYPE_WEB&version=RECAPTCHA_ENTERPRISE"
         ))
         .send()
         .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(enterprise.status(), StatusCode::NOT_IMPLEMENTED);
-    let enterprise_body: Value = enterprise.json().await.unwrap();
-    assert_eq!(enterprise_body["error"]["code"], 501);
-    assert_eq!(enterprise_body["error"]["status"], "NOT_IMPLEMENTED");
     assert_eq!(
-        enterprise_body["error"]["errors"][0]["reason"],
-        "unimplemented"
+        enterprise["kind"],
+        "identitytoolkit#GetRecaptchaConfigResponse"
+    );
+    assert_eq!(
+        enterprise["recaptchaKey"],
+        "Fake-key__Do-not-send-this-to-Recaptcha_"
+    );
+    assert_eq!(
+        enterprise["recaptchaEnforcementState"],
+        json!([
+            { "provider": "PHONE_PROVIDER", "enforcementState": "OFF" },
+            { "provider": "EMAIL_PASSWORD_PROVIDER", "enforcementState": "OFF" }
+        ])
     );
 
     let recaptcha: Value = client

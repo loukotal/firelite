@@ -1204,7 +1204,11 @@ fn sign_in_with_phone_number(
         if claims.project_id != project_id {
             return Err(error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"));
         }
-        validate_phone_number_available(project, &verification.phone_number, Some(&claims.local_id))?;
+        validate_phone_number_available(
+            project,
+            &verification.phone_number,
+            Some(&claims.local_id),
+        )?;
         let phone_number = verification.phone_number;
         let (local_id, email, old_phone_number, id_token) = {
             let user = project

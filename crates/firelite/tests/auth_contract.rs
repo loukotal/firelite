@@ -1456,6 +1456,135 @@ async fn auth_custom_token_sign_in_creates_local_user() {
 }
 
 #[tokio::test]
+async fn auth_phone_credential_update_links_the_authenticated_user() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake"
+        ))
+        .json(&json!({
+            "email": "phone-link@example.test",
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let local_id = created["localId"].as_str().unwrap();
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "localId": local_id,
+            "customAttributes": "{\"role\":\"member\"}"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let verification: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:sendVerificationCode?key=fake"
+        ))
+        .json(&json!({ "phoneNumber": "+15555550123" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_info = verification["sessionInfo"].as_str().unwrap();
+    let codes: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/verificationCodes"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let code = codes["verificationCodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["sessionInfo"] == session_info)
+        .unwrap()["code"]
+        .as_str()
+        .unwrap();
+
+    let updated: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:update?key=fake"
+        ))
+        .json(&json!({
+            "idToken": created["idToken"],
+            "phoneVerificationInfo": { "sessionInfo": session_info, "code": code },
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(updated["localId"], local_id);
+    assert_eq!(updated["email"], "phone-link@example.test");
+    assert_eq!(updated["phoneNumber"], "+15555550123");
+    assert_eq!(
+        decode_jwt_payload(updated["idToken"].as_str().unwrap())["role"],
+        "member"
+    );
+
+    let accounts: Value = client
+        .get(format!(
+            "{base_url}/emulator/v1/projects/demo-firelite/accounts"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accounts["users"].as_array().unwrap().len(), 1);
+    let user = &accounts["users"][0];
+    assert_eq!(user["localId"], local_id);
+    assert_eq!(user["email"], "phone-link@example.test");
+    assert_eq!(user["phoneNumber"], "+15555550123");
+    assert_eq!(user["customAttributes"], "{\"role\":\"member\"}");
+    assert_eq!(user["providerUserInfo"].as_array().unwrap().len(), 2);
+    assert!(user["providerUserInfo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|provider| provider["providerId"] == "password"));
+    assert!(user["providerUserInfo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|provider| provider["providerId"] == "phone"));
+}
+
+#[tokio::test]
 async fn auth_custom_token_claims_and_provider_are_in_the_exchanged_id_token_without_persisting() {
     let base_url = spawn_app().await;
     let client = reqwest::Client::new();

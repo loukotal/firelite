@@ -350,6 +350,14 @@ struct PhoneSignInRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PhoneUpdateRequest {
+    id_token: String,
+    phone_verification_info: PhoneVerificationInfo,
+    return_secure_token: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MfaEnrollmentStartRequest {
     id_token: String,
     phone_enrollment_info: PhoneEnrollmentInfo,
@@ -747,6 +755,10 @@ async fn identity_action(
         "accounts:signInWithPhoneNumber" => {
             let payload = parse_payload(payload)?;
             Ok(sign_in_with_phone_number(&state, payload)?)
+        }
+        "accounts:update" => {
+            let payload = parse_payload(payload)?;
+            Ok(update_phone_number(&state, payload)?)
         }
         "accounts:lookup" => {
             let payload = parse_payload(payload)?;
@@ -1251,6 +1263,88 @@ fn sign_in_with_phone_number(
     });
     project.verification_codes.remove(&payload.session_info);
     Ok(response)
+}
+
+fn update_phone_number(
+    state: &SharedState,
+    payload: PhoneUpdateRequest,
+) -> Result<serde_json::Value, AuthError> {
+    let claims = parse_client_token_claims(&state.auth, &payload.id_token)?;
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects
+        .get_mut(&claims.project_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    let verification = project
+        .verification_codes
+        .get(&payload.phone_verification_info.session_info)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"))?;
+    if !matches!(verification.purpose, VerificationPurpose::FirstFactorSignIn) {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_SESSION_INFO"));
+    }
+    if verification.code != payload.phone_verification_info.code {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_CODE"));
+    }
+
+    let user = project
+        .users_by_id
+        .get(&claims.local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if user.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    if claims.issued_at < user.valid_since_secs {
+        return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+    }
+    validate_phone_number_available(project, &verification.phone_number, Some(&claims.local_id))?;
+
+    let phone_number = verification.phone_number;
+    let (local_id, email, old_phone_number, id_token) = {
+        let user = project
+            .users_by_id
+            .get_mut(&claims.local_id)
+            .expect("user was checked above");
+        let old_phone_number = user.phone_number.replace(phone_number.clone());
+        upsert_phone_provider(user, &phone_number);
+        user.last_login_at_ms = Some(now_ms());
+        (
+            user.local_id.clone(),
+            user.email.clone(),
+            old_phone_number,
+            make_token(&claims.project_id, user),
+        )
+    };
+    if let Some(old_phone_number) = old_phone_number {
+        project.user_ids_by_phone.remove(&old_phone_number);
+        project
+            .user_ids_by_provider
+            .remove(&("phone".to_string(), old_phone_number));
+    }
+    project
+        .user_ids_by_phone
+        .insert(phone_number.clone(), local_id.clone());
+    project.user_ids_by_provider.insert(
+        ("phone".to_string(), phone_number.clone()),
+        local_id.clone(),
+    );
+    project
+        .verification_codes
+        .remove(&payload.phone_verification_info.session_info);
+
+    let include_token = payload.return_secure_token.unwrap_or(true);
+    Ok(json!({
+        "kind": "identitytoolkit#SetAccountInfoResponse",
+        "localId": local_id,
+        "email": email,
+        "phoneNumber": phone_number,
+        "idToken": if include_token { id_token } else { String::new() },
+        "refreshToken": if include_token {
+            make_refresh_token(&claims.project_id, &claims.local_id)
+        } else {
+            String::new()
+        },
+        "expiresIn": "3600",
+    }))
 }
 
 fn start_mfa_enrollment(

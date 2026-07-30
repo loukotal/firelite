@@ -1641,18 +1641,20 @@ fn sign_in_with_custom_token(
     payload: CustomTokenRequest,
 ) -> Result<AuthResponse, AuthError> {
     let project_id = state.auth.default_project_id().to_string();
-    let local_id = parse_custom_token_subject(&payload.token)?;
+    let custom_token = parse_custom_token(&payload.token)?;
+    let local_id = custom_token.local_id;
     let email = format!("{local_id}@custom-token.local");
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.clone()).or_default();
     let record = get_or_create_user(project, &local_id, &email, "custom", &local_id);
 
     record.last_login_at_ms = Some(now_ms());
-    Ok(auth_response(
-        &project_id,
-        record,
-        payload.return_secure_token,
-    ))
+    let mut response = auth_response(&project_id, record, payload.return_secure_token);
+    if payload.return_secure_token.unwrap_or(true) {
+        response.id_token =
+            make_token_with_custom_token_claims(&project_id, record, custom_token.claims.as_ref());
+    }
+    Ok(response)
 }
 
 fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResponse, AuthError> {
@@ -2042,9 +2044,17 @@ fn percent_encode_query(value: &str) -> String {
         .collect()
 }
 
-fn parse_custom_token_subject(token: &str) -> Result<String, AuthError> {
+struct CustomToken {
+    local_id: String,
+    claims: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn parse_custom_token(token: &str) -> Result<CustomToken, AuthError> {
     if !token.contains('.') {
-        return Ok(token.to_string());
+        return Ok(CustomToken {
+            local_id: token.to_string(),
+            claims: None,
+        });
     }
 
     let Some(payload) = token.split('.').nth(1) else {
@@ -2055,13 +2065,19 @@ fn parse_custom_token_subject(token: &str) -> Result<String, AuthError> {
         .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_CUSTOM_TOKEN"))?;
     let value: serde_json::Value = serde_json::from_slice(&decoded)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "INVALID_CUSTOM_TOKEN"))?;
-    value
+    let local_id = value
         .get("uid")
         .or_else(|| value.get("sub"))
         .or_else(|| value.get("user_id"))
         .and_then(|sub| sub.as_str())
         .map(ToOwned::to_owned)
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_CUSTOM_TOKEN"))
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_CUSTOM_TOKEN"))?;
+    let claims = value
+        .get("claims")
+        .and_then(|claims| claims.as_object())
+        .cloned();
+
+    Ok(CustomToken { local_id, claims })
 }
 
 fn parse_post_body(body: &str) -> HashMap<String, String> {
@@ -2199,13 +2215,30 @@ fn parse_refresh_token(token: &str) -> Result<RefreshTokenClaims, AuthError> {
 }
 
 fn make_token(project_id: &str, record: &UserRecord) -> String {
-    make_token_with_second_factor(project_id, record, None)
+    make_token_with_custom_token_claims(project_id, record, None)
+}
+
+fn make_token_with_custom_token_claims(
+    project_id: &str,
+    record: &UserRecord,
+    custom_token_claims: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> String {
+    make_token_with_second_factor_and_claims(project_id, record, None, custom_token_claims)
 }
 
 fn make_token_with_second_factor(
     project_id: &str,
     record: &UserRecord,
     second_factor: Option<(&str, &str)>,
+) -> String {
+    make_token_with_second_factor_and_claims(project_id, record, second_factor, None)
+}
+
+fn make_token_with_second_factor_and_claims(
+    project_id: &str,
+    record: &UserRecord,
+    second_factor: Option<(&str, &str)>,
+    custom_token_claims: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
     let issued_at = now_secs();
@@ -2263,6 +2296,12 @@ fn make_token_with_second_factor(
             for (key, value) in claims {
                 object.insert(key, value);
             }
+        }
+    }
+    if let Some(claims) = custom_token_claims {
+        let object = payload.as_object_mut().expect("token payload is an object");
+        for (key, value) in claims {
+            object.insert(key.clone(), value.clone());
         }
     }
     let payload = URL_SAFE_NO_PAD.encode(payload.to_string());

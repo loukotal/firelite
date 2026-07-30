@@ -1444,12 +1444,27 @@ async fn auth_custom_token_sign_in_creates_local_user() {
 }
 
 #[tokio::test]
-async fn auth_custom_token_claims_are_in_the_exchanged_id_token_without_persisting() {
+async fn auth_custom_token_claims_and_provider_are_in_the_exchanged_id_token_without_persisting() {
     let base_url = spawn_app().await;
     let client = reqwest::Client::new();
     let url = format!(
         "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=fake"
     );
+
+    client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/projects/demo-firelite/accounts?key=fake"
+        ))
+        .json(&json!({
+            "localId": "agent-user-with-claims",
+            "email": "agent-user-with-claims@example.test",
+            "password": "secret123"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
 
     let signed_in: Value = client
         .post(&url)
@@ -1471,6 +1486,7 @@ async fn auth_custom_token_claims_are_in_the_exchanged_id_token_without_persisti
     let claims = decode_jwt_payload(signed_in["idToken"].as_str().unwrap());
     assert_eq!(claims["role"], "embed-onboarding");
     assert_eq!(claims["prepared"], true);
+    assert_eq!(claims["firebase"]["sign_in_provider"], "custom");
 
     let signed_in_without_claims: Value = client
         .post(url)

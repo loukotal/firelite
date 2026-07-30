@@ -2215,7 +2215,7 @@ fn parse_refresh_token(token: &str) -> Result<RefreshTokenClaims, AuthError> {
 }
 
 fn make_token(project_id: &str, record: &UserRecord) -> String {
-    make_token_with_custom_token_claims(project_id, record, None)
+    make_token_with_second_factor_and_claims(project_id, record, None, None, None)
 }
 
 fn make_token_with_custom_token_claims(
@@ -2223,7 +2223,13 @@ fn make_token_with_custom_token_claims(
     record: &UserRecord,
     custom_token_claims: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> String {
-    make_token_with_second_factor_and_claims(project_id, record, None, custom_token_claims)
+    make_token_with_second_factor_and_claims(
+        project_id,
+        record,
+        None,
+        custom_token_claims,
+        Some("custom"),
+    )
 }
 
 fn make_token_with_second_factor(
@@ -2231,7 +2237,7 @@ fn make_token_with_second_factor(
     record: &UserRecord,
     second_factor: Option<(&str, &str)>,
 ) -> String {
-    make_token_with_second_factor_and_claims(project_id, record, second_factor, None)
+    make_token_with_second_factor_and_claims(project_id, record, second_factor, None, None)
 }
 
 fn make_token_with_second_factor_and_claims(
@@ -2239,14 +2245,17 @@ fn make_token_with_second_factor_and_claims(
     record: &UserRecord,
     second_factor: Option<(&str, &str)>,
     custom_token_claims: Option<&serde_json::Map<String, serde_json::Value>>,
+    sign_in_provider: Option<&str>,
 ) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
     let issued_at = now_secs();
-    let sign_in_provider = record
-        .providers
-        .first()
-        .map(|provider| provider.provider_id.as_str())
-        .unwrap_or("anonymous");
+    let sign_in_provider = sign_in_provider.unwrap_or_else(|| {
+        record
+            .providers
+            .first()
+            .map(|provider| provider.provider_id.as_str())
+            .unwrap_or("anonymous")
+    });
     let mut payload = serde_json::json!({
         "aud": project_id,
         "iss": format!("https://securetoken.google.com/{project_id}"),

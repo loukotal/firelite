@@ -1527,6 +1527,141 @@ exports.api.__trigger = {
     }
 
     #[tokio::test]
+    async fn captures_exact_raw_http_body_without_consuming_request_stream() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+function bodyParser(req, res, next) {
+  const chunks = [];
+  req.on("data", chunk => chunks.push(Buffer.from(chunk)));
+  req.on("end", () => {
+    try {
+      const body = Buffer.concat(chunks);
+      if (/^application\/json\b/i.test(req.headers["content-type"] || "")) {
+        req.body = JSON.parse(body.toString("utf8"));
+      }
+      next();
+    } catch (error) {
+      res.statusCode = 400;
+      res.end(error.message);
+    }
+  });
+}
+
+exports.api = (req, res) => {
+  bodyParser(req, res, () => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({
+      rawBodyIsBuffer: Buffer.isBuffer(req.rawBody),
+      rawBodyBytes: Array.from(req.rawBody),
+      body: req.body ?? null
+    }));
+  });
+};
+exports.api.__trigger = {
+  name: "api",
+  regions: ["us-central1"],
+  httpsTrigger: {}
+};
+"#,
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
+        let state = Arc::new(FunctionsState {
+            project_id: "demo-firelite".to_string(),
+            active: Arc::new(RwLock::new(Some(worker.active.clone()))),
+            client: reqwest::Client::new(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let endpoint = format!("{base_url}/demo-firelite/us-central1/api");
+        let json_payload = "{\n  \"message\": \"preserve spacing\",\n  \"count\": 2\n}\n";
+        let json_response: serde_json::Value = client
+            .post(&endpoint)
+            .header("content-type", "application/json")
+            .body(json_payload)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(json_response["rawBodyIsBuffer"], true);
+        assert_eq!(
+            json_response["rawBodyBytes"],
+            serde_json::json!(json_payload.as_bytes())
+        );
+        assert_eq!(json_response["body"]["message"], "preserve spacing");
+        assert_eq!(json_response["body"]["count"], 2);
+
+        let text_payload = "line one\r\nline two\n";
+        let text_response: serde_json::Value = client
+            .post(&endpoint)
+            .header("content-type", "text/plain")
+            .body(text_payload)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(text_response["rawBodyIsBuffer"], true);
+        assert_eq!(
+            text_response["rawBodyBytes"],
+            serde_json::json!(text_payload.as_bytes())
+        );
+
+        let empty_response: serde_json::Value = client
+            .post(&endpoint)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(empty_response["rawBodyIsBuffer"], true);
+        assert_eq!(empty_response["rawBodyBytes"], serde_json::json!([]));
+
+        let binary_payload = vec![0, 255, 128, 10, 123, 0];
+        let binary_response: serde_json::Value = client
+            .post(&endpoint)
+            .header("content-type", "application/octet-stream")
+            .body(binary_payload.clone())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(binary_response["rawBodyIsBuffer"], true);
+        assert_eq!(
+            binary_response["rawBodyBytes"],
+            serde_json::json!(binary_payload)
+        );
+
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn restarts_worker_after_unexpected_exit() {
         if !node_can_start_loopback_server().await {
             return;

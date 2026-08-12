@@ -135,6 +135,7 @@ run cargo test --workspace
 run cargo package --package firelite --allow-dirty
 if [[ "${SKIP_HARNESS}" != "1" ]]; then
   run node harness/src/test-auth-admin-sdk.mjs
+  run node harness/src/test-functions-raw-body.mjs
   run node harness/src/test-pubsub-sdk.mjs
 fi
 

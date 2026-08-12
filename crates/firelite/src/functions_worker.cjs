@@ -108,9 +108,12 @@ async function invokeHandler(req, res, handler, descriptor) {
     return;
   }
 
-  installHttpCompatibilityHelpers(req, res);
   if (descriptor.trigger.taskQueue) {
+    installHttpCompatibilityHelpers(req, res);
     req.body = await readJsonBody(req);
+  } else {
+    installRawBodyCapture(req);
+    installHttpCompatibilityHelpers(req, res);
   }
 
   try {
@@ -124,6 +127,18 @@ async function invokeHandler(req, res, handler, descriptor) {
     }
     res.end(error && error.stack ? error.stack : String(error));
   }
+}
+
+function installRawBodyCapture(req) {
+  const chunks = [];
+  req.rawBody = Buffer.alloc(0);
+
+  req.prependListener("data", (chunk) => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  req.prependListener("end", () => {
+    req.rawBody = Buffer.concat(chunks);
+  });
 }
 
 function installHttpCompatibilityHelpers(req, res) {

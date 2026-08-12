@@ -130,6 +130,7 @@ cd harness
 npm install
 npm run test:auth
 npm run test:auth-admin-sdk
+npm run test:functions
 npm run test:storage-sdk
 ```
 

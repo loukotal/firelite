@@ -1788,6 +1788,21 @@ async fn auth_email_link_oob_flow_signs_in_user_once() {
 
     assert_eq!(signed_in["email"], "link@example.test");
 
+    let lookup: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=fake"
+        ))
+        .json(&json!({ "idToken": signed_in["idToken"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lookup["users"][0]["emailVerified"], true);
+
     let replay = client
         .post(format!(
             "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signInWithEmailLink?key=fake"
@@ -1797,6 +1812,92 @@ async fn auth_email_link_oob_flow_signs_in_user_once() {
             "oobCode": oob_code,
             "returnSecureToken": true
         }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn auth_verify_email_oob_flow_marks_user_verified_once() {
+    let base_url = spawn_app().await;
+    let client = reqwest::Client::new();
+    let email = "verify@example.test";
+
+    let created: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake"
+        ))
+        .json(&json!({
+            "email": email,
+            "password": "secret123",
+            "returnSecureToken": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let sent: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=fake"
+        ))
+        .json(&json!({
+            "requestType": "VERIFY_EMAIL",
+            "idToken": created["idToken"],
+            "continueUrl": "http://localhost/verified",
+            "returnOobLink": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sent["email"], email);
+    assert!(sent["oobLink"]
+        .as_str()
+        .unwrap()
+        .contains("mode=verifyEmail"));
+
+    let applied: Value = client
+        .get(sent["oobLink"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(applied["emailVerified"], true);
+
+    let lookup: Value = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=fake"
+        ))
+        .json(&json!({ "idToken": created["idToken"] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lookup["users"][0]["emailVerified"], true);
+
+    let replay = client
+        .post(format!(
+            "{base_url}/identitytoolkit.googleapis.com/v1/accounts:update?key=fake"
+        ))
+        .json(&json!({ "oobCode": sent["oobCode"] }))
         .send()
         .await
         .unwrap();

@@ -48,6 +48,8 @@ export FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099
 export GCLOUD_PROJECT=demo-firelite
 ```
 
+Magic sign-in links, email-verification links, and phone verification codes are printed prominently in the emulator console. Interactive terminals use cyan, magenta, and yellow highlighting; redirected output and `NO_COLOR` remain plain text unless `FORCE_COLOR` is set. Pending values are also available from `/emulator/v1/projects/{project}/oobCodes` and `/emulator/v1/projects/{project}/verificationCodes`.
+
 Example REST call:
 
 ```sh

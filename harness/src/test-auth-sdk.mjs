@@ -5,11 +5,13 @@ import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { initializeApp, deleteApp } from "firebase/app";
 import {
+  applyActionCode,
   connectAuthEmulator,
   createUserWithEmailAndPassword,
   getAuth,
   isSignInWithEmailLink,
   getMultiFactorResolver,
+  sendEmailVerification,
   sendSignInLinkToEmail,
   signInWithCustomToken,
   signInAnonymously,
@@ -54,6 +56,7 @@ try {
   await testAnonymousFlow(auth);
   await testPhoneMfaFlow(auth, baseUrl);
   await testCustomTokenFlow(auth);
+  await testEmailVerificationFlow(auth, baseUrl);
   await testEmailLinkFlow(auth, baseUrl);
 
   await deleteApp(app);
@@ -200,6 +203,27 @@ async function testEmailLinkFlow(auth, baseUrl) {
 
   const credential = await signInWithEmailLink(auth, email, link);
   assert.equal(credential.user.email, email);
+  assert.equal(credential.user.emailVerified, true);
+}
+
+async function testEmailVerificationFlow(auth, baseUrl) {
+  await signOut(auth);
+  const email = `sdk-verify-${Date.now()}@example.test`;
+  const created = await createUserWithEmailAndPassword(auth, email, "secret123");
+  assert.equal(created.user.emailVerified, false);
+
+  await sendEmailVerification(created.user, {
+    url: "http://localhost/verified"
+  });
+  const oobCodes = await fetchJson(`${baseUrl}/emulator/v1/projects/demo-firelite/oobCodes`);
+  const verification = oobCodes.oobCodes.find(
+    (entry) => entry.requestType === "VERIFY_EMAIL" && entry.email === email
+  );
+  assert.ok(verification);
+
+  await applyActionCode(auth, verification.oobCode);
+  await created.user.reload();
+  assert.equal(created.user.emailVerified, true);
 }
 
 async function waitForHealth(baseUrl, child) {

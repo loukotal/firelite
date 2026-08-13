@@ -14,6 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    io::IsTerminal,
     path::{Path as FilePath, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -439,9 +440,16 @@ struct IdpRequest {
 #[serde(rename_all = "camelCase")]
 struct SendOobCodeRequest {
     request_type: String,
-    email: String,
+    email: Option<String>,
+    id_token: Option<String>,
     continue_url: Option<String>,
     return_oob_link: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyActionCodeRequest {
+    oob_code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -758,8 +766,13 @@ async fn identity_action(
             Ok(sign_in_with_phone_number(&state, payload)?)
         }
         "accounts:update" => {
-            let payload = parse_payload(payload)?;
-            Ok(update_phone_number(&state, payload)?)
+            if payload.get("oobCode").is_some() {
+                let payload = parse_payload(payload)?;
+                serde_json::to_value(apply_action_code(&state, payload)?)
+            } else {
+                let payload = parse_payload(payload)?;
+                Ok(update_phone_number(&state, payload)?)
+            }
         }
         "accounts:lookup" => {
             let payload = parse_payload(payload)?;
@@ -882,23 +895,39 @@ async fn oob_action(
     State(state): State<SharedState>,
     Query(query): Query<OobActionQuery>,
 ) -> AuthResult<serde_json::Value> {
+    let mode = query.mode.unwrap_or_else(|| "action".to_string());
     let project_id = query
         .project_id
         .unwrap_or_else(|| state.auth.default_project_id().to_string());
     let oob_code = query
         .oob_code
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_OOB_CODE"))?;
-    let projects = state.auth.projects.read().expect("auth state poisoned");
-    let record = projects
-        .get(&project_id)
-        .and_then(|project| project.oob_codes.get(&oob_code))
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_OOB_CODE"))?;
+    let record = {
+        let projects = state.auth.projects.read().expect("auth state poisoned");
+        projects
+            .get(&project_id)
+            .and_then(|project| project.oob_codes.get(&oob_code))
+            .cloned()
+            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_OOB_CODE"))?
+    };
+    let email_verified = if mode == "verifyEmail" && record.request_type == "VERIFY_EMAIL" {
+        apply_action_code(
+            &state,
+            ApplyActionCodeRequest {
+                oob_code: oob_code.clone(),
+            },
+        )?;
+        true
+    } else {
+        false
+    };
     serde_json::to_value(json!({
-        "mode": query.mode.unwrap_or_else(|| "action".to_string()),
+        "mode": mode,
         "oobCode": oob_code,
         "projectId": project_id,
         "email": record.email,
         "requestType": record.request_type,
+        "emailVerified": email_verified,
     }))
     .map(Json)
     .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"))
@@ -1895,15 +1924,42 @@ fn send_oob_code(
     auth_base_url: &str,
     payload: SendOobCodeRequest,
 ) -> Result<OobCodeResponse, AuthError> {
-    if payload.request_type != "EMAIL_SIGNIN" && payload.request_type != "PASSWORD_RESET" {
+    if payload.request_type != "EMAIL_SIGNIN"
+        && payload.request_type != "PASSWORD_RESET"
+        && payload.request_type != "VERIFY_EMAIL"
+    {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "UNSUPPORTED_OOB_REQUEST_TYPE",
         ));
     }
 
-    let _continue_url = payload.continue_url.as_deref().unwrap_or("");
-    let email = normalize_email(&payload.email);
+    let email = if payload.request_type == "VERIFY_EMAIL" {
+        let id_token = payload
+            .id_token
+            .as_deref()
+            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_ID_TOKEN"))?;
+        let claims = parse_client_token_claims(&state.auth, id_token)?;
+        let projects = state.auth.projects.read().expect("auth state poisoned");
+        let user = projects
+            .get(&claims.project_id)
+            .and_then(|project| project.users_by_id.get(&claims.local_id))
+            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+        if user.disabled {
+            return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+        }
+        if claims.issued_at < user.valid_since_secs {
+            return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+        }
+        user.email.clone()
+    } else {
+        normalize_email(
+            payload
+                .email
+                .as_deref()
+                .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_EMAIL"))?,
+        )
+    };
     let code = format!("firelite-oob-{}", Uuid::new_v4());
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.to_string()).or_default();
@@ -1918,10 +1974,15 @@ fn send_oob_code(
             created_at_ms: now_ms(),
         },
     );
-    let oob_link = payload
-        .return_oob_link
-        .unwrap_or(false)
-        .then(|| make_oob_link(auth_base_url, project_id, &payload.request_type, &code));
+    let link = make_oob_link(
+        auth_base_url,
+        project_id,
+        &payload.request_type,
+        &code,
+        payload.continue_url.as_deref(),
+    );
+    log_email_action(&payload.request_type, &email, &code, &link);
+    let oob_link = payload.return_oob_link.unwrap_or(false).then_some(link);
 
     Ok(OobCodeResponse {
         email,
@@ -1959,12 +2020,47 @@ fn sign_in_with_email_link(
         &normalize_email(&payload.email),
     );
     record.last_login_at_ms = Some(now_ms());
+    record.email_verified = true;
 
     Ok(auth_response(
         &project_id,
         record,
         payload.return_secure_token,
     ))
+}
+
+fn apply_action_code(
+    state: &SharedState,
+    payload: ApplyActionCodeRequest,
+) -> Result<EmptyResponse, AuthError> {
+    let project_id = state.auth.default_project_id().to_string();
+    let mut projects = state.auth.projects.write().expect("auth state poisoned");
+    let project = projects
+        .get_mut(&project_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_OOB_CODE"))?;
+    let code = project
+        .oob_codes
+        .get(&payload.oob_code)
+        .cloned()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_OOB_CODE"))?;
+    if code.request_type != "VERIFY_EMAIL" {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_OOB_CODE"));
+    }
+    let local_id = project
+        .user_ids_by_email
+        .get(&normalize_email(&code.email))
+        .cloned()
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    let user = project
+        .users_by_id
+        .get_mut(&local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if user.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    user.email_verified = true;
+    project.oob_codes.remove(&payload.oob_code);
+    Ok(EmptyResponse {})
 }
 
 async fn list_accounts(
@@ -2163,17 +2259,72 @@ fn make_oob_link(
     project_id: &str,
     request_type: &str,
     oob_code: &str,
+    continue_url: Option<&str>,
 ) -> String {
     let mode = match request_type {
         "PASSWORD_RESET" => "resetPassword",
         "EMAIL_SIGNIN" => "signIn",
+        "VERIFY_EMAIL" => "verifyEmail",
         _ => "action",
     };
+    if request_type == "EMAIL_SIGNIN" {
+        if let Some(continue_url) = continue_url {
+            let (base, fragment) = continue_url
+                .split_once('#')
+                .map_or((continue_url, None), |(base, fragment)| {
+                    (base, Some(fragment))
+                });
+            let separator = if base.contains('?') { '&' } else { '?' };
+            let fragment = fragment.map_or(String::new(), |value| format!("#{value}"));
+            return format!(
+                "{base}{separator}mode={mode}&oobCode={}&apiKey=fake{fragment}",
+                percent_encode_query(oob_code)
+            );
+        }
+    }
     format!(
         "{auth_base_url}/emulator/action?mode={mode}&oobCode={}&projectId={}",
         percent_encode_query(oob_code),
         percent_encode_query(project_id)
     )
+}
+
+fn log_email_action(request_type: &str, email: &str, code: &str, link: &str) {
+    let label = match request_type {
+        "EMAIL_SIGNIN" => "magic sign-in link",
+        "VERIFY_EMAIL" => "email verification link",
+        "PASSWORD_RESET" => "password reset link",
+        _ => "email action link",
+    };
+    let message = if auth_log_colors_enabled() {
+        format!(
+            "\u{1b}[1;36mAUTH {label}\u{1b}[0m \u{1b}[2mfor\u{1b}[0m {email}\n  \u{1b}[1;35m{link}\u{1b}[0m\n  \u{1b}[2;33mcode: {code}\u{1b}[0m"
+        )
+    } else {
+        format!("AUTH {label} for {email}\n  {link}\n  code: {code}")
+    };
+    eprintln!("{message}");
+}
+
+fn log_sms_code(phone_number: &str, code: &str) {
+    let message = if auth_log_colors_enabled() {
+        format!(
+            "\u{1b}[1;36mAUTH SMS verification code\u{1b}[0m \u{1b}[2mfor\u{1b}[0m {phone_number}: \u{1b}[1;33m{code}\u{1b}[0m"
+        )
+    } else {
+        format!("AUTH SMS verification code for {phone_number}: {code}")
+    };
+    eprintln!("{message}");
+}
+
+fn auth_log_colors_enabled() -> bool {
+    let forced = std::env::var("FORCE_COLOR")
+        .ok()
+        .is_some_and(|value| value != "0");
+    forced
+        || (std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM").ok().as_deref() != Some("dumb")
+            && std::io::stderr().is_terminal())
 }
 
 fn request_base_url(headers: &HeaderMap) -> String {
@@ -2636,11 +2787,13 @@ fn create_verification_code(
     let digest = hasher.finalize();
     let number = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
     project.next_verification_code_sequence += 1;
+    let code = format!("{number:06}");
+    log_sms_code(&phone_number, &code);
     project.verification_codes.insert(
         session_info.clone(),
         VerificationCodeRecord {
             phone_number,
-            code: format!("{number:06}"),
+            code,
             sequence: project.next_verification_code_sequence,
             purpose,
         },

@@ -16,9 +16,10 @@ Status legend:
 | Auth | `accounts:delete` | implemented | Supports `localId` or `idToken`. |
 | Auth | `accounts:signInWithCustomToken` | implemented | Accepts local unsigned JWT-like tokens or plain local IDs; official fixture capture still needed. |
 | Auth | `accounts:signInWithIdp` | implemented | Tolerant provider/raw ID/email flow for Google/OAuth popup paths; official fixture capture still needed. |
-| Auth | `accounts:sendOobCode` / `accounts:signInWithEmailLink` | implemented | In-memory single-use email-link OOB codes. |
+| Auth | `accounts:sendOobCode` / `accounts:signInWithEmailLink` | implemented | In-memory single-use email-link OOB codes; sign-in verifies the email address. Clickable magic links are printed to the console. |
+| Auth | `sendEmailVerification` / `applyActionCode` | implemented | Supports `VERIFY_EMAIL` through `accounts:sendOobCode` and `accounts:update`; verification links are single-use and printed to the console. |
 | Auth | Phone MFA enrollment and sign-in | implemented | Supports v2 enrollment/sign-in start and finalize, inspectable SMS codes, `mfaInfo`, MFA-required password responses, and second-factor token claims. |
-| Auth | `/emulator/v1/projects/{project}/verificationCodes` | implemented | Lists pending phone verification sessions and codes for local tests. |
+| Auth | `/emulator/v1/projects/{project}/verificationCodes` | implemented | Lists pending phone verification sessions and codes for local tests. New SMS codes are also printed to the console. |
 | Auth | Web reCAPTCHA discovery | implemented | Matches firebase-tools fallback behavior: v2 Enterprise config returns structured 501 and v1 params return the emulator fake site key/token. |
 | Auth | `/emulator/v1/projects/{project}/oobCodes` | implemented | Local inspection endpoint for email-link tests/debugging. |
 | Auth | `/emulator/v1/projects/{project}/accounts` list/reset | implemented | Used for test isolation and fixture comparison. |

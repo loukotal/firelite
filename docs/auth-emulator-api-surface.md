@@ -1,6 +1,6 @@
 # Auth Emulator API Surface
 
-This tracks the `firebase/auth` client APIs currently used by the app and the emulator-compatible endpoints Firelite needs to support.
+This tracks the `firebase/auth` client APIs used by a reference consumer application and the emulator-compatible endpoints Firelite needs to support. The source paths below are relative to that consumer checkout, not this repository.
 
 ## Source files
 

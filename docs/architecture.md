@@ -21,6 +21,10 @@ Firelite separates checkout-specific process work from shared stateful emulator 
 
 The Functions supervisor monitors both source changes and the Node child process. Unexpected worker exits temporarily mark Functions unhealthy and trigger bounded-backoff restarts. CI runs that do not edit function source can use `--no-reload` to avoid polling the checkout.
 
+The watched directory must contain a loadable Node package entrypoint. Firelite does not compile TypeScript or run an application build command; the consuming checkout owns its initial build and development compiler/watch process. HTTP function requests use `/{project}/{region}/{functionName}`. The proxy preserves handler response status and body while removing hop-by-hop headers; worker transport failures return `502 Bad Gateway`.
+
+Runtime configuration is explicit. Firelite takes listener addresses and ports from CLI flags and does not read `firebase.json` or `firebase.local.json`. A consuming project's wrapper script is responsible for translating its local port configuration into Firelite arguments.
+
 ## Compatibility strategy
 
 Compatibility is defined by observed SDK/emulator behavior, not by production API completeness. The discovery harness runs official emulators and real SDK probes, captures request/response/event fixtures, and converts those fixtures into Rust contract tests.

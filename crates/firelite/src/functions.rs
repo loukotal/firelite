@@ -139,11 +139,7 @@ pub async fn prepare(config: FunctionsConfig) -> anyhow::Result<PreparedFunction
     let state = Arc::new(FunctionsState {
         project_id: config.project_id.clone(),
         active: Arc::new(RwLock::new(Some(started.active.clone()))),
-        client: reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(60))
-            .build()
-            .context("failed to configure functions HTTP client")?,
+        client: build_functions_http_client()?,
     });
 
     Ok(PreparedFunctions {
@@ -152,6 +148,15 @@ pub async fn prepare(config: FunctionsConfig) -> anyhow::Result<PreparedFunction
         state,
         started,
     })
+}
+
+fn build_functions_http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to configure functions HTTP client")
 }
 
 impl PreparedFunctions {
@@ -1522,6 +1527,67 @@ exports.api.__trigger = {
         assert_eq!(posted["url"], "/");
         assert_eq!(posted["body"], r#"{"ok":true}"#);
         assert_eq!(posted["header"], "post-header");
+
+        worker.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preserves_function_redirect_without_following_it() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-functions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(
+            &dir.join("index.js"),
+            r#"
+exports.api = (_req, res) => {
+  res.statusCode = 302;
+  res.setHeader("location", "https://example.invalid/oidc/login");
+  res.setHeader("x-firelite-redirect", "preserved");
+  res.end("redirect body");
+};
+exports.api.__trigger = {
+  name: "api",
+  regions: ["us-central1"],
+  httpsTrigger: {}
+};
+"#,
+        );
+
+        let mut worker = start_worker("demo-firelite", &dir, &[], 1).await.unwrap();
+        let state = Arc::new(FunctionsState {
+            project_id: "demo-firelite".to_string(),
+            active: Arc::new(RwLock::new(Some(worker.active.clone()))),
+            client: build_functions_http_client().unwrap(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("{base_url}/demo-firelite/us-central1/api"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            "https://example.invalid/oidc/login"
+        );
+        assert_eq!(
+            response.headers().get("x-firelite-redirect").unwrap(),
+            "preserved"
+        );
+        assert_eq!(response.text().await.unwrap(), "redirect body");
 
         worker.child.kill().await.unwrap();
     }

@@ -16,6 +16,7 @@ use tracing_subscriber::{
 #[derive(Debug, Parser)]
 #[command(name = "firelite")]
 #[command(about = "Lightweight Firebase Emulator Suite-compatible local services")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

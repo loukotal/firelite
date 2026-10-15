@@ -5,24 +5,31 @@ Firelite is an experimental local emulator system for a small, tested subset of 
 > [!WARNING]
 > Firelite is alpha software. It is not an official Firebase, Google, or Firebase Emulator Suite project, and it is not affiliated with or endorsed by Firebase or Google. It implements only selected local emulator behaviors and must not be used as a production Firebase replacement.
 
-The immediate goal is to discover local SDK/emulator contracts, capture them as fixtures, and implement only the compatibility surface needed for local tests and checkout-specific Cloud Functions workflows.
+## Why Firelite?
+
+- **One backend:** Auth, Storage, Pub/Sub, and Cloud Tasks share a Rust process. Only Functions need a Node worker; no JVM is required.
+- **Checkout-local workflows:** choose ports and project IDs per checkout, filter Functions exports, and reload on source changes.
+- **Local task API:** create, inspect, and delete Cloud Tasks, with dispatch to local handlers, alongside Storage and Pub/Sub triggers.
+
+Firelite focuses on a compact development stack. The [official suite](https://firebase.google.com/docs/emulator-suite) offers broader Firebase coverage, including Firestore, Realtime Database, Hosting, and Security Rules testing. Fast startup and low idle overhead are Firelite design goals; comparative benchmarks are not yet published.
 
 ## Features
 
-- Rust workspace and `firelite` CLI.
-- Auth emulator state namespaced by Firebase project ID.
-- Storage emulator state for common JSON API and `/v0` object paths.
-- Pub/Sub emulator state for HTTP/JSON topic, subscription, publish, pull, and acknowledge flows.
-- Cloud Tasks emulator state for task create/list/delete and local task queue dispatch.
-- Checkout-local Cloud Functions supervisor with Node handler discovery and reload.
-- Contract tests and SDK harnesses for supported Auth and Storage flows.
-- Architecture and compatibility notes in `docs/`.
+- Auth: project-scoped password, anonymous, custom-token, provider, and email-link sign-in; phone MFA; Admin SDK user management and custom claims; optional SQLite user persistence.
+- Storage: JSON API and Firebase `/v0` object upload, metadata, download, list, and delete; direct and resumable uploads; Gen 1/Gen 2 object-finalize triggers.
+- Pub/Sub: HTTP/JSON topic and subscription CRUD, publish/pull/acknowledge, a unary gRPC subset, and Gen 1/Gen 2 publish triggers.
+- Cloud Tasks: in-memory task create/get/list/delete and local HTTP task queue dispatch.
+- Functions: checkout-local Node worker with Gen 1/Gen 2 export discovery, HTTP/callable handlers, export filters, and file-watch reload.
+- Browser console for Auth users, email action codes, and Storage objects.
+- Rust contract tests and Firebase Web, Firebase Admin, and Google Cloud SDK harnesses.
 
 ## Requirements
 
 - Rust 1.82 or newer to install or build Firelite with Cargo.
-- Node.js to load and execute Cloud Functions.
+- Node.js to load and execute Cloud Functions; install your functions package's dependencies before starting Firelite.
 - npm only for the optional SDK compatibility harness.
+
+Install the CLI from this checkout with `cargo install --path crates/firelite`, or use the `cargo run` commands below.
 
 ## Quick start
 
@@ -49,6 +56,7 @@ Point local SDKs at the listeners:
 ```sh
 export FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099
 export FIREBASE_STORAGE_EMULATOR_HOST=127.0.0.1:9199
+export STORAGE_EMULATOR_HOST=http://127.0.0.1:9199
 export PUBSUB_EMULATOR_HOST=127.0.0.1:8085
 export CLOUD_TASKS_EMULATOR_HOST=127.0.0.1:9899
 export GCLOUD_PROJECT=demo-firelite
@@ -101,11 +109,17 @@ firelite emulators --project demo-myrepo-agent-17 --watch ./functions --filter a
 firelite emulators --project demo-myrepo-agent-17 --watch ./functions --no-reload
 ```
 
-`daemon` runs the shared Auth-compatible backend. `functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports and reloads it when watched files change. TypeScript functions should be built by the surrounding test/dev workflow before Firelite loads the functions directory. `reset` removes one project's Auth users from the SQLite database selected by `--persist`.
+`daemon` serves Auth, Storage, Pub/Sub, Cloud Tasks, and the console on one port, without a Functions worker. Its default project comes from `--project`, then `GCLOUD_PROJECT`, then `GOOGLE_CLOUD_PROJECT`, falling back to `demo-firelite`.
+
+`functions` runs a checkout-local Node worker supervisor for HTTP/callable Cloud Functions exports at `/{project}/{region}/{function}` and reloads it when watched files change. Build TypeScript functions before Firelite loads the functions directory. `reset` removes one project's Auth users from the SQLite database selected by `--persist`.
 
 `emulators` runs Auth, Storage, Pub/Sub, Cloud Tasks, and Functions together. By default it listens on the local setup ports: Auth on `127.0.0.1:9099`, Storage on `127.0.0.1:9199`, Pub/Sub on `127.0.0.1:8085`, Cloud Tasks on `127.0.0.1:9899`, and Functions on `127.0.0.1:5001`. The listeners share the same state. `--persist <FILE>` persists Auth users; other service state remains in memory.
 
 Listener ports come from Firelite's CLI flags. Firelite does not read `firebase.json` or `firebase.local.json`, so a project wrapper should translate its configured ports into `--auth-port`, `--storage-port`, `--pubsub-port`, `--tasks-port`, and `--functions-port` explicitly.
+
+Open the console on the Auth port at [http://127.0.0.1:9099/__/ui](http://127.0.0.1:9099/__/ui). Set its project and bucket fields to match your application. You can create, list, and delete users and objects, inspect email action codes, and reset Auth users or a Storage bucket.
+
+`STORAGE_EMULATOR_HOST` configures `@google-cloud/storage`. For Firebase Web SDK clients, use `connectAuthEmulator`, `connectStorageEmulator`, and `connectFunctionsEmulator` with the corresponding addresses. When using `daemon`, point all backend service clients at its single port instead.
 
 For CI runs where function source does not change after startup, pass `--no-reload` to skip the file polling task. The combined runner loads and validates the initial Functions worker before opening the other emulator listeners. The Functions listener reports worker liveness at `/__/health`.
 
@@ -129,7 +143,9 @@ cargo run -p firelite -- \
 
 Pass `--filter` to run only selected Cloud Functions exports/names. It can be repeated, for example `--filter api --filter e2e`.
 
-Pub/Sub accepts HTTP/JSON emulator calls at `PUBSUB_EMULATOR_HOST=127.0.0.1:8085` for topic/subscription create, publish, pull, and acknowledge flows. In `firelite emulators`, publishing also asynchronously invokes matching Gen 1 and Gen 2 Pub/Sub functions; this background dispatch does not require a subscription.
+Storage supports direct and resumable uploads through the Firebase Web and Google Cloud Storage SDKs. In `firelite emulators`, completed uploads also dispatch object-finalize events asynchronously to matching Gen 1 and Gen 2 Functions, with bucket filtering and custom metadata.
+
+Pub/Sub supports HTTP/JSON topic/subscription CRUD and publish, pull, and acknowledge flows. Its unary gRPC subset covers `CreateTopic`, `Publish`, `CreateSubscription`, `Pull`, and `Acknowledge`; the Node `@google-cloud/pubsub` harness exercises topic/subscription creation, publishing, and unary pull. Streaming pull and push subscriptions are unsupported. In `firelite emulators`, publishing also asynchronously invokes matching Gen 1 and Gen 2 Pub/Sub functions; this background dispatch does not require a subscription.
 
 Cloud Tasks accepts Firebase Admin SDK task queue `createTask` calls at `CLOUD_TASKS_EMULATOR_HOST=127.0.0.1:9899`. In `firelite emulators`, enqueued task queue requests are dispatched directly to the checkout-local functions worker when the filter matches the queue/function name. In the basic implementation, dispatch is synchronous and runs before the create-task response returns. Dispatch targets are intentionally limited to local `http://` URLs so the runtime does not carry a TLS stack.
 
@@ -137,7 +153,7 @@ For a checkout with custom ports, run the installed binary from its Functions di
 
 ```sh
 firelite emulators \
-  --project bf-demo-a24dc \
+  --project demo-myrepo-agent-17 \
   --host 127.0.0.1 \
   --auth-port 9099 \
   --storage-port 9199 \
@@ -173,17 +189,18 @@ Run the optional Firebase SDK compatibility harness:
 cd harness
 npm install
 npm run test:auth
-npm run test:auth-admin-sdk
 npm run test:functions
-npm run test:pubsub-sdk
 npm run test:storage-sdk
+npm run test:pubsub-sdk
 ```
 
-The harness starts Firelite on temporary loopback ports and verifies supported flows with the official Firebase Web and Admin SDK packages.
+The harness starts Firelite on temporary loopback ports. `test:auth` runs both Firebase Web and Admin Auth tests; `test:storage-sdk` runs Firebase Web and Google Cloud Storage tests; `test:pubsub-sdk` runs Google Cloud Pub/Sub tests.
 
 ## Project Status
 
-Firelite is intentionally incomplete. See:
+Firelite implements a local compatibility subset. Firestore, Realtime Database, Hosting, full Security Rules evaluation, Auth import/export, Auth background triggers, and Storage events other than object finalize are outside the current feature set. Cloud Tasks dispatch is single-attempt and does not implement production scheduling/retry semantics.
+
+See:
 
 - `docs/compatibility-matrix.md` for supported, planned, and unknown surfaces.
 - `docs/auth-emulator-api-surface.md` for Auth compatibility notes.

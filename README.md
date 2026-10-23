@@ -26,7 +26,7 @@ Firelite focuses on a compact development stack. The [official suite](https://fi
 ## Requirements
 
 - Rust 1.82 or newer to install or build Firelite with Cargo.
-- Node.js to load and execute Cloud Functions; install your functions package's dependencies before starting Firelite.
+- Node.js to load and execute Cloud Functions; use a supported LTS security release and install your functions package's dependencies before starting Firelite. Development and CI use Node 24.22.1, pinned in `.node-version`.
 - npm only for the optional SDK compatibility harness.
 
 Install the CLI from this checkout with `cargo install --path crates/firelite`, or use the `cargo run` commands below.
@@ -142,6 +142,19 @@ cargo run -p firelite -- \
 ```
 
 Pass `--filter` to run only selected Cloud Functions exports/names. It can be repeated, for example `--filter api --filter e2e`.
+
+For faster startup without a separate entrypoint, opt into selective loading:
+
+```sh
+firelite emulators --project demo-firelite --watch ./functions \
+  --selective-load --filter api --filter e2e
+```
+
+`--selective-load` works with `functions` and `emulators` and requires Node.js 22.15+ (or 23.5+) and a compiled ESM entrypoint (`.mjs` or `"type": "module"`). Firelite parses the entrypoint before importing it, keeps selected exports and their referenced local declarations/imports, and removes unused declarations and imports. No npm dependency or test-only entrypoint is needed. Ordinary `--filter` still loads the full entrypoint before filtering registrations.
+
+Selective filters must name static **export paths**, not runtime function names. Selection operates at top-level export granularity: `--filter tasks.run` loads the whole `tasks` export, then registers only matching handlers. Dependencies of retained imports load normally; Firelite does not recursively prune dependency modules or barrels. Shared dependencies may still load scheduled code.
+
+This mode deliberately skips initialization side effects in discarded declarations and imports. Explicit setup imports such as `import './firebase.js'` and standalone setup statements remain, in source order. Keep required initialization explicit. CommonJS entrypoints, wildcard `export *`, retained `eval`, and unknown export paths produce an error rather than falling back to a full load. Source changes and worker restarts use the same selection.
 
 Storage supports direct and resumable uploads through the Firebase Web and Google Cloud Storage SDKs. In `firelite emulators`, completed uploads also dispatch object-finalize events asynchronously to matching Gen 1 and Gen 2 Functions, with bucket filtering and custom metadata.
 

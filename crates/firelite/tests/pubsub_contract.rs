@@ -339,6 +339,7 @@ exports.gen2.__endpoint = {{
         source_dir: dir,
         addr: functions_addr,
         filters: Vec::new(),
+        selective_load: false,
         reload_on_change: false,
     })
     .await

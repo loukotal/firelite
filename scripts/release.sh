@@ -132,6 +132,7 @@ run cargo check -p firelite
 run cargo fmt --all -- --check
 run cargo clippy --workspace --all-targets -- -D warnings
 run cargo test --workspace
+run node --test crates/firelite/tests/selective_load.cjs
 run cargo package --package firelite --allow-dirty
 if [[ "${SKIP_HARNESS}" != "1" ]]; then
   run node harness/src/test-auth-admin-sdk.mjs

@@ -2,6 +2,9 @@
   "name": "firelite-discovery-harness",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24.22.1"
+  },
   "scripts": {
     "discover:auth": "node src/discover-auth.mjs",
     "test:auth": "npm run test:auth-sdk && npm run test:auth-admin-sdk",
@@ -12,11 +15,15 @@
     "test:storage-sdk": "node src/test-storage-sdk.mjs && node src/test-google-cloud-storage-sdk.mjs"
   },
   "dependencies": {
-    "@google-cloud/pubsub": "^4.11.0",
-    "@google-cloud/storage": "^7.21.0",
+    "@google-cloud/pubsub": "^6.3.1",
+    "@google-cloud/storage": "^8.4.0",
     "express": "^4.22.2",
     "firebase": "^11.0.0",
-    "firebase-admin": "^13.0.0",
-    "firebase-tools": "^13.0.0"
+    "firebase-admin": "^14.5.0"
+  },
+  "overrides": {
+    "@firebase/firestore": {
+      "@grpc/grpc-js": "^1.14.5"
+    }
   }
 }

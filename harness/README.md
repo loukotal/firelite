@@ -8,6 +8,8 @@ Run official Firebase emulators with real Firebase Web/Admin/Google SDK probes, 
 
 ## Planned flow
 
+`discover:auth` currently writes a placeholder fixture; it does not start official emulators. The SDK E2E scripts below launch Firelite directly, so this package does not install the unused `firebase-tools` CLI.
+
 ```sh
 npm install
 npm run discover:auth
@@ -60,3 +62,9 @@ npm run test:auth-admin-sdk
 ```
 
 This verifies `createUser`, `getUser`, `getUserByEmail`, `listUsers`, and `deleteUser` through `firebase-admin/auth`.
+
+## Dependency security
+
+Use the Node version pinned in `../.node-version`, then `npm ci` and `npm audit`.
+
+The scoped `@grpc/grpc-js` override keeps Firebase Web SDK's Firestore dependency on a patched 1.x release. Firebase pins it to `~1.9.0`, which is affected by GHSA-m9gg-hp2v-232j and GHSA-f596-whhp-79r4. Remove the override when Firebase's native range resolves to `>=1.13.6` (1.13.x) or `>=1.14.5` (1.14.x), and a fresh install passes the audit.

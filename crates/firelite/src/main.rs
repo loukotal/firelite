@@ -57,6 +57,9 @@ enum Command {
         /// Function export/name filter. Can be repeated.
         #[arg(long = "filter")]
         filters: Vec<String>,
+        /// Prune unused top-level ESM exports and imports before loading (Node 22.15+).
+        #[arg(long, requires = "filters")]
+        selective_load: bool,
         /// Disable source polling and automatic worker reloads.
         #[arg(long)]
         no_reload: bool,
@@ -82,6 +85,9 @@ enum Command {
         /// Function export/name filter. Can be repeated.
         #[arg(long = "filter")]
         filters: Vec<String>,
+        /// Prune unused top-level ESM exports and imports before loading (Node 22.15+).
+        #[arg(long, requires = "filters")]
+        selective_load: bool,
         /// Disable source polling and automatic worker reloads. Recommended in CI.
         #[arg(long)]
         no_reload: bool,
@@ -126,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             watch,
             filters,
+            selective_load,
             no_reload,
         } => {
             let addr = parse_addr("functions", &host, port)?;
@@ -134,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
                 source_dir: watch,
                 addr,
                 filters,
+                selective_load,
                 reload_on_change: !no_reload,
             })
             .await
@@ -148,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             functions_port,
             watch,
             filters,
+            selective_load,
             no_reload,
             persist,
         } => {
@@ -161,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 source_dir: watch,
                 addr: functions_addr,
                 filters: filters.clone(),
+                selective_load,
                 reload_on_change: !no_reload,
             })
             .await?;

@@ -23,6 +23,8 @@ The Functions supervisor monitors both source changes and the Node child process
 
 The watched directory must contain a loadable Node package entrypoint. Firelite does not compile TypeScript or run an application build command; the consuming checkout owns its initial build and development compiler/watch process. HTTP function requests use `/{project}/{region}/{functionName}`. The proxy preserves handler response status and body while removing hop-by-hop headers; worker transport failures return `502 Bad Gateway`.
 
+Opt-in `--selective-load` passes filters into the worker before import. A bundled Acorn parser identifies top-level ESM exports and conservatively traces their local binding dependencies. A Node module load hook replaces only the entrypoint's source, preserving its URL, relative resolution, and module identity. Explicit side-effect imports and standalone statements are roots too. Other modules load normally. Selection is top-level; nested handler registration still uses the existing descriptor filter. Unsupported entrypoints fail explicitly. Worker assets, including the parser and its license, are embedded in the binary and materialized atomically in a content-addressed directory.
+
 Runtime configuration is explicit. Firelite takes listener addresses and ports from CLI flags and does not read `firebase.json` or `firebase.local.json`. A consuming project's wrapper script is responsible for translating its local port configuration into Firelite arguments.
 
 ## Compatibility strategy

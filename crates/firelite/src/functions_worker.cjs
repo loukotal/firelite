@@ -24,7 +24,29 @@ process.env.FIREBASE_CONFIG ||= JSON.stringify({ projectId });
 main().catch((error) => fail(error && error.stack ? error.stack : String(error)));
 
 async function main() {
+  const options = JSON.parse(process.argv[4] || "{}");
   const entrypoint = resolveEntrypoint(sourceDir);
+  if (options.selectiveLoad) {
+    if (!isEsmEntrypoint(entrypoint, sourceDir)) {
+      throw new Error("--selective-load requires an ESM entrypoint (.mjs or type: module)");
+    }
+    const { registerHooks } = require("node:module");
+    if (!registerHooks) {
+      throw new Error("--selective-load requires Node.js 22.15+ or 23.5+");
+    }
+    const { selectExports } = require("./functions_selective.cjs");
+    const entryUrls = new Set([
+      pathToFileURL(path.resolve(entrypoint)).href,
+      pathToFileURL(fs.realpathSync(entrypoint)).href,
+    ]);
+    const selectedSource = selectExports(fs.readFileSync(entrypoint, "utf8"), options.filters || []);
+    registerHooks({
+      load(url, context, nextLoad) {
+        if (entryUrls.has(url)) return { format: "module", source: selectedSource, shortCircuit: true };
+        return nextLoad(url, context);
+      },
+    });
+  }
   const loaded = await loadEntrypoint(entrypoint, sourceDir);
   const functions = discoverFunctions(loaded);
   const handlers = new Map();

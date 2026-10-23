@@ -32,6 +32,7 @@ pub struct FunctionsConfig {
     pub source_dir: PathBuf,
     pub addr: SocketAddr,
     pub filters: Vec<String>,
+    pub selective_load: bool,
     pub reload_on_change: bool,
 }
 
@@ -128,9 +129,15 @@ pub async fn serve(config: FunctionsConfig) -> anyhow::Result<()> {
 }
 
 pub async fn prepare(config: FunctionsConfig) -> anyhow::Result<PreparedFunctions> {
-    let started = start_worker(&config.project_id, &config.source_dir, &config.filters, 1)
-        .await
-        .context("failed to load initial functions worker")?;
+    let started = start_worker_with_options(
+        &config.project_id,
+        &config.source_dir,
+        &config.filters,
+        1,
+        config.selective_load,
+    )
+    .await
+    .context("failed to load initial functions worker")?;
     log_loaded_worker(&started.active);
 
     let listener = TcpListener::bind(config.addr)
@@ -177,9 +184,7 @@ impl PreparedFunctions {
         let (reload_tx, reload_rx) = mpsc::channel(8);
 
         let supervisor = tokio::spawn(supervise_workers(
-            config.project_id.clone(),
-            config.source_dir.clone(),
-            config.filters.clone(),
+            config.clone(),
             state.active.clone(),
             reload_rx,
             started.child,
@@ -367,7 +372,7 @@ async fn proxy_request(
     let response =
         match proxy_request_inner(state, &path, uri.query(), method.clone(), headers, body).await {
             Ok(response) => response,
-            Err(response) => response,
+            Err(error) => error.into_response(),
         };
     debug!(
         %method,
@@ -386,26 +391,20 @@ async fn proxy_request_inner(
     method: Method,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, Response> {
-    let route = parse_function_route(path).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            "expected /{project}/{region}/{functionName}",
-        )
-            .into_response()
-    })?;
+) -> Result<Response, (StatusCode, &'static str)> {
+    let route = parse_function_route(path).ok_or((
+        StatusCode::NOT_FOUND,
+        "expected /{project}/{region}/{functionName}",
+    ))?;
 
     if route.project_id != state.project_id {
-        return Err((StatusCode::NOT_FOUND, "project not served by this worker").into_response());
+        return Err((StatusCode::NOT_FOUND, "project not served by this worker"));
     }
 
-    let active = state.active.read().await.clone().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "functions worker is still loading",
-        )
-            .into_response()
-    })?;
+    let active = state.active.read().await.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "functions worker is still loading",
+    ))?;
     let key = FunctionKey {
         region: route.region,
         name: route.name,
@@ -414,7 +413,7 @@ async fn proxy_request_inner(
         .http_functions
         .get(&key)
         .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "function not found").into_response())?;
+        .ok_or((StatusCode::NOT_FOUND, "function not found"))?;
 
     let mut target = format!(
         "{}/__firelite__/invoke/{}{}",
@@ -428,7 +427,7 @@ async fn proxy_request_inner(
     }
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid method").into_response())?;
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid method"))?;
     let mut request = state.client.request(reqwest_method, target).body(body);
     for (name, value) in headers.iter() {
         if name.as_str().eq_ignore_ascii_case("host")
@@ -441,13 +440,13 @@ async fn proxy_request_inner(
 
     let proxied = request.send().await.map_err(|error| {
         error!(%error, generation = active.generation, "function worker request failed");
-        (StatusCode::BAD_GATEWAY, "function worker request failed").into_response()
+        (StatusCode::BAD_GATEWAY, "function worker request failed")
     })?;
     let status = proxied.status();
     let response_headers = proxied.headers().clone();
     let response_body = proxied.bytes().await.map_err(|error| {
         error!(%error, generation = active.generation, "function worker response failed");
-        (StatusCode::BAD_GATEWAY, "function worker response failed").into_response()
+        (StatusCode::BAD_GATEWAY, "function worker response failed")
     })?;
 
     let mut builder = Response::builder().status(status);
@@ -464,7 +463,6 @@ async fn proxy_request_inner(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "invalid function response",
             )
-                .into_response()
         })
 }
 
@@ -516,9 +514,7 @@ pub(crate) fn parse_function_route(path: &str) -> Option<ParsedRoute> {
 }
 
 async fn supervise_workers(
-    project_id: String,
-    source_dir: PathBuf,
-    filters: Vec<String>,
+    config: FunctionsConfig,
     active: Arc<RwLock<Option<ActiveWorker>>>,
     mut reload_rx: mpsc::Receiver<()>,
     mut current: Child,
@@ -566,7 +562,15 @@ async fn supervise_workers(
         }
         generation += 1;
 
-        match start_worker(&project_id, &source_dir, &filters, generation).await {
+        match start_worker_with_options(
+            &config.project_id,
+            &config.source_dir,
+            &config.filters,
+            generation,
+            config.selective_load,
+        )
+        .await
+        {
             Ok(started) => {
                 log_loaded_worker(&started.active);
                 let old = std::mem::replace(&mut current, started.child);
@@ -592,17 +596,29 @@ async fn supervise_workers(
     }
 }
 
+#[cfg(test)]
 async fn start_worker(
     project_id: &str,
     source_dir: &Path,
     filters: &[String],
     generation: u64,
 ) -> anyhow::Result<StartedWorker> {
+    start_worker_with_options(project_id, source_dir, filters, generation, false).await
+}
+
+async fn start_worker_with_options(
+    project_id: &str,
+    source_dir: &Path,
+    filters: &[String],
+    generation: u64,
+    selective_load: bool,
+) -> anyhow::Result<StartedWorker> {
     let worker_path = materialize_functions_worker().await?;
     let mut child = Command::new("node")
         .arg(worker_path)
         .arg(source_dir)
         .arg(project_id)
+        .arg(serde_json::json!({ "filters": filters, "selectiveLoad": selective_load }).to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -673,19 +689,33 @@ fn log_loaded_worker(active: &ActiveWorker) {
 }
 
 const FUNCTIONS_WORKER: &[u8] = include_bytes!("functions_worker.cjs");
+const WORKER_ASSETS: &[(&str, &[u8])] = &[
+    ("functions_worker.cjs", FUNCTIONS_WORKER),
+    (
+        "functions_selective.cjs",
+        include_bytes!("functions_selective.cjs"),
+    ),
+    ("vendor/acorn.cjs", include_bytes!("vendor/acorn.cjs")),
+    (
+        "vendor/acorn.LICENSE",
+        include_bytes!("vendor/acorn.LICENSE"),
+    ),
+];
 
 async fn materialize_functions_worker() -> anyhow::Result<PathBuf> {
     let mut hasher = Sha256::new();
-    hasher.update(FUNCTIONS_WORKER);
+    for (name, bytes) in WORKER_ASSETS {
+        hasher.update(name.as_bytes());
+        hasher.update(bytes);
+    }
     let hash = format!("{:x}", hasher.finalize());
-    let worker_dir = std::env::temp_dir().join("firelite");
-    let worker_path = worker_dir.join(format!(
-        "functions_worker-{}-{}.cjs",
+    let worker_dir = std::env::temp_dir().join("firelite").join(format!(
+        "functions_worker-{}-{}",
         env!("CARGO_PKG_VERSION"),
         &hash[..16]
     ));
 
-    tokio::fs::create_dir_all(&worker_dir)
+    tokio::fs::create_dir_all(worker_dir.join("vendor"))
         .await
         .with_context(|| {
             format!(
@@ -694,21 +724,31 @@ async fn materialize_functions_worker() -> anyhow::Result<PathBuf> {
             )
         })?;
 
-    let needs_write = match tokio::fs::read(&worker_path).await {
-        Ok(existing) => existing != FUNCTIONS_WORKER,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read worker asset {}", worker_path.display()));
+    for (name, bytes) in WORKER_ASSETS {
+        let worker_path = worker_dir.join(name);
+        let needs_write = match tokio::fs::read(&worker_path).await {
+            Ok(existing) => existing != *bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read worker asset {}", worker_path.display())
+                });
+            }
+        };
+        if needs_write {
+            let temporary = worker_path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+            tokio::fs::write(&temporary, bytes).await.with_context(|| {
+                format!("failed to write worker asset {}", worker_path.display())
+            })?;
+            tokio::fs::rename(&temporary, &worker_path)
+                .await
+                .with_context(|| {
+                    format!("failed to publish worker asset {}", worker_path.display())
+                })?;
         }
-    };
-    if needs_write {
-        tokio::fs::write(&worker_path, FUNCTIONS_WORKER)
-            .await
-            .with_context(|| format!("failed to write worker asset {}", worker_path.display()))?;
     }
 
-    Ok(worker_path)
+    Ok(worker_dir.join("functions_worker.cjs"))
 }
 
 fn filter_descriptors(
@@ -1728,6 +1768,90 @@ exports.api.__trigger = {
     }
 
     #[tokio::test]
+    async fn selective_loading_survives_reload_and_worker_exit() {
+        if !node_can_start_loopback_server().await {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("firelite-selective-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_file(&dir.join("package.json"), r#"{"type":"module"}"#);
+        write_file(
+            &dir.join("index.js"),
+            "export { api } from './api.js'; export { cron } from './cron.js';",
+        );
+        write_file(
+            &dir.join("cron.js"),
+            "throw new Error('unselected cron loaded'); export const cron = {};",
+        );
+        let api_source = r#"
+export const api = Object.assign((req, res) => {
+  res.end('VERSION');
+  if (req.url === '/crash') setTimeout(() => process.exit(17), 10);
+}, { __trigger: { name: 'api', regions: ['us-central1'], httpsTrigger: {} } });
+"#;
+        write_file(&dir.join("api.js"), &api_source.replace("VERSION", "v1"));
+        let config = FunctionsConfig {
+            project_id: "demo-firelite".to_string(),
+            source_dir: dir.clone(),
+            addr: "127.0.0.1:0".parse().unwrap(),
+            filters: vec!["api".to_string()],
+            selective_load: true,
+            reload_on_change: true,
+        };
+        let prepared = prepare(config.clone()).await.unwrap();
+        let active = prepared.state.active.clone();
+        let (reload_tx, reload_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(supervise_workers(
+            config,
+            active.clone(),
+            reload_rx,
+            prepared.started.child,
+            1,
+        ));
+        let client = reqwest::Client::new();
+        for generation in 1..=3 {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if active
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|worker| worker.generation >= generation)
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("selective worker should become ready");
+            let worker = active.read().await.clone().unwrap();
+            assert_eq!(worker.functions.len(), 1);
+            let suffix = if generation == 2 { "/crash" } else { "/" };
+            let response = client
+                .get(format!(
+                    "{}/__firelite__/invoke/api{suffix}",
+                    worker.base_url
+                ))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert_eq!(response, if generation == 1 { "v1" } else { "v2" });
+            if generation == 1 {
+                write_file(&dir.join("api.js"), &api_source.replace("VERSION", "v2"));
+                reload_tx.send(()).await.unwrap();
+            }
+        }
+        supervisor.abort();
+        let _ = supervisor.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn restarts_worker_after_unexpected_exit() {
         if !node_can_start_loopback_server().await {
             return;
@@ -1758,9 +1882,14 @@ exports.api.__trigger = {
         let active = Arc::new(RwLock::new(Some(started.active)));
         let (reload_tx, reload_rx) = mpsc::channel(1);
         let supervisor = tokio::spawn(supervise_workers(
-            "demo-firelite".to_string(),
-            dir,
-            Vec::new(),
+            FunctionsConfig {
+                project_id: "demo-firelite".to_string(),
+                source_dir: dir,
+                addr: "127.0.0.1:0".parse().unwrap(),
+                filters: Vec::new(),
+                selective_load: false,
+                reload_on_change: true,
+            },
             active.clone(),
             reload_rx,
             started.child,

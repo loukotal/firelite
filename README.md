@@ -15,7 +15,7 @@ Firelite focuses on a compact development stack. The [official suite](https://fi
 
 ## Features
 
-- Auth: project-scoped password, anonymous, custom-token, provider, and email-link sign-in; phone MFA; Admin SDK user management and custom claims; optional SQLite user persistence.
+- Auth: project-scoped password, anonymous, custom-token, Google and other IdP (popup, redirect, and credential), and email-link sign-in; phone MFA; Admin SDK user management and custom claims; optional SQLite user persistence.
 - Storage: JSON API and Firebase `/v0` object upload, metadata, download, list, and delete; direct and resumable uploads; Gen 1/Gen 2 object-finalize triggers.
 - Pub/Sub: HTTP/JSON topic and subscription CRUD, publish/pull/acknowledge, a unary gRPC subset, and Gen 1/Gen 2 publish triggers.
 - Cloud Tasks: in-memory task create/get/list/delete and local HTTP task queue dispatch.
@@ -89,6 +89,19 @@ firelite reset --project demo-firelite --persist .firelite/state.sqlite
 ```
 
 Magic sign-in links, email-verification links, and phone verification codes are printed prominently in the emulator console. Interactive terminals use cyan, magenta, and yellow highlighting; redirected output and `NO_COLOR` remain plain text unless `FORCE_COLOR` is set. Pending values are also available from `/emulator/v1/projects/{project}/oobCodes` and `/emulator/v1/projects/{project}/verificationCodes`.
+
+Google sign-in works against fake accounts. With `connectAuthEmulator`, `signInWithPopup` and `signInWithRedirect` open a Firelite page where you pick an existing Google account or create one. Tests can skip the UI and pass fake claims as JSON or an unsigned JWT:
+
+```js
+await signInWithCredential(
+  auth,
+  GoogleAuthProvider.credential(
+    JSON.stringify({ sub: "google-123", email: "ada@example.test", email_verified: true, name: "Ada" })
+  )
+);
+```
+
+As in the official emulator, the browser loads Google's `gapi` helper script for popup and redirect sign-in, so those flows need internet access. Redirect sign-in also needs the app and emulator on the same site (for example, both on `127.0.0.1`), because browsers partition the helper iframe's storage across sites.
 
 Example REST call:
 

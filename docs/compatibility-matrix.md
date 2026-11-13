@@ -15,7 +15,7 @@ Status legend:
 | Auth | `accounts:lookup` by ID token/local ID | implemented | Unsigned local JWT-like token, sufficient for local contract flow. |
 | Auth | `accounts:delete` | implemented | Supports `localId` or `idToken`. |
 | Auth | `accounts:signInWithCustomToken` | implemented | Accepts local unsigned JWT-like tokens or plain local IDs; official fixture capture still needed. |
-| Auth | `accounts:signInWithIdp` | implemented | Tolerant provider/raw ID/email flow for Google/OAuth popup paths; official fixture capture still needed. |
+| Auth | `accounts:signInWithIdp` and IdP widget | implemented | Fake `id_token` claims (JSON or unsigned JWT) from `postBody`, `requestUri` query, or fragment; Google profile, `federatedId`, and `rawUserInfo`; linking via `idToken`; trusted-email account matching with `needConfirmation`; MFA pending credentials. `/emulator/auth/handler` and `/emulator/auth/iframe` serve the popup/redirect flow. |
 | Auth | `accounts:sendOobCode` / `accounts:signInWithEmailLink` | implemented | In-memory single-use email-link OOB codes; sign-in verifies the email address. Clickable magic links are printed to the console. |
 | Auth | `sendEmailVerification` / `applyActionCode` | implemented | Supports `VERIFY_EMAIL` through `accounts:sendOobCode` and `accounts:update`; verification links are single-use and printed to the console. |
 | Auth | Phone MFA enrollment and sign-in | implemented | Supports v2 enrollment/sign-in start and finalize, inspectable SMS codes, `mfaInfo`, MFA-required password responses, and second-factor token claims. |

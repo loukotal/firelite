@@ -3,7 +3,7 @@ use anyhow::Context;
 use axum::{
     extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -66,6 +66,8 @@ pub fn router() -> Router<SharedState> {
             get(list_verification_codes),
         )
         .route("/emulator/action", get(oob_action))
+        .route("/emulator/auth/handler", get(idp_widget))
+        .route("/emulator/auth/iframe", get(idp_iframe))
 }
 
 #[derive(Debug, Clone)]
@@ -257,11 +259,15 @@ struct UserRecord {
     last_login_at_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProviderRecord {
     provider_id: String,
     raw_id: String,
     email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    photo_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,9 +437,11 @@ struct CustomTokenRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IdpRequest {
-    post_body: String,
+    post_body: Option<String>,
     request_uri: Option<String>,
+    id_token: Option<String>,
     return_secure_token: Option<bool>,
+    return_idp_credential: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -636,6 +644,12 @@ struct ProviderInfo {
     provider_id: String,
     raw_id: String,
     email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    federated_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    photo_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -788,7 +802,7 @@ async fn identity_action(
         }
         "accounts:signInWithIdp" => {
             let payload = parse_payload(payload)?;
-            serde_json::to_value(sign_in_with_idp(&state, payload)?)
+            Ok(sign_in_with_idp(&state, payload)?)
         }
         "accounts:sendOobCode" => {
             let payload = parse_payload(payload)?;
@@ -972,6 +986,7 @@ fn sign_up(state: &SharedState, payload: SignUpRequest) -> Result<AuthResponse, 
                     provider_id: "password".to_string(),
                     raw_id: local_id,
                     email,
+                    ..Default::default()
                 }]
             })
             .unwrap_or_default(),
@@ -1039,6 +1054,7 @@ fn admin_create_user(
             provider_id: "password".to_string(),
             raw_id: local_id.clone(),
             email: email.clone(),
+            ..Default::default()
         }],
         created_at_ms: now_ms(),
         last_login_at_ms: None,
@@ -1315,6 +1331,7 @@ fn sign_in_with_phone_number(
                 provider_id: "phone".to_string(),
                 raw_id: verification.phone_number.clone(),
                 email: String::new(),
+                ..Default::default()
             }],
             created_at_ms: now,
             last_login_at_ms: None,
@@ -1842,81 +1859,916 @@ fn sign_in_with_custom_token(
     Ok(response)
 }
 
-fn sign_in_with_idp(state: &SharedState, payload: IdpRequest) -> Result<AuthResponse, AuthError> {
+/// Profile extracted from a fake IdP credential (unsigned JWT or JSON claims).
+#[derive(Debug)]
+struct IdpProfile {
+    provider_id: String,
+    raw_id: String,
+    email: Option<String>,
+    email_verified: bool,
+    display_name: Option<String>,
+    photo_url: Option<String>,
+}
+
+/// How a `signInWithIdp` request maps onto local accounts.
+enum IdpTarget {
+    /// Link the IdP identity to the user that owns the request's `idToken`.
+    Link(String),
+    /// A user already has this provider identity.
+    Provider(String),
+    /// A user with the same email exists and the IdP vouches for the email.
+    VerifiedEmail(String),
+    /// A user with the same email exists but the IdP email is unverified.
+    NeedConfirmation(String),
+    New,
+}
+
+fn is_federated_provider(provider_id: &str) -> bool {
+    !matches!(provider_id, "password" | "phone" | "custom" | "anonymous")
+}
+
+fn sign_in_with_idp(
+    state: &SharedState,
+    payload: IdpRequest,
+) -> Result<serde_json::Value, AuthError> {
     let project_id = state.auth.default_project_id().to_string();
-    let _request_uri = payload.request_uri.as_deref().unwrap_or("http://localhost");
-    let post_body = parse_post_body(&payload.post_body);
-    let provider_id = post_body
+    let params = idp_params(payload.request_uri.as_deref(), payload.post_body.as_deref());
+    let provider_id = params
         .get("providerId")
-        .or_else(|| post_body.get("provider_id"))
+        .or_else(|| params.get("provider_id"))
+        .map(|provider_id| provider_id.trim().to_ascii_lowercase())
+        .filter(|provider_id| !provider_id.is_empty())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_CREDENTIAL_OR_PROVIDER_ID"))?;
+    let oauth_id_token = params.get("id_token").filter(|token| !token.is_empty());
+    let oauth_access_token = params.get("access_token").filter(|token| !token.is_empty());
+    let claims = idp_claims(
+        &params,
+        oauth_id_token.map(String::as_str),
+        oauth_access_token.map(String::as_str),
+    )?;
+    let (profile, mut response) = idp_profile(&provider_id, &claims);
+    response["oauthAccessToken"] = json!(oauth_access_token
         .cloned()
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "MISSING_PROVIDER_ID"))?;
-    let raw_id = post_body
-        .get("rawId")
-        .or_else(|| post_body.get("raw_id"))
-        .or_else(|| post_body.get("id_token"))
-        .or_else(|| post_body.get("access_token"))
-        .or_else(|| post_body.get("oauth_token"))
-        .cloned()
-        .unwrap_or_else(|| format!("{provider_id}:{}", Uuid::new_v4()));
-    let email = post_body
-        .get("email")
-        .cloned()
-        .unwrap_or_else(|| format!("{}@{}.local", sanitize_email_part(&raw_id), provider_id));
-    let email = normalize_email(&email);
+        .unwrap_or_else(|| format!("FirebaseAuthEmulatorFakeAccessToken_{provider_id}")));
+    if let Some(oauth_id_token) = oauth_id_token {
+        response["oauthIdToken"] = json!(oauth_id_token);
+    }
+    let linking_claims = payload
+        .id_token
+        .as_deref()
+        .map(|id_token| parse_client_token_claims(&state.auth, id_token))
+        .transpose()?;
 
     let mut projects = state.auth.projects.write().expect("auth state poisoned");
     let project = projects.entry(project_id.clone()).or_default();
-    let local_id = project
-        .user_ids_by_provider
-        .get(&(provider_id.clone(), raw_id.clone()))
-        .cloned();
-    let record = match local_id.and_then(|id| project.users_by_id.get_mut(&id)) {
-        Some(record) => record,
-        None => {
-            let local_id = Uuid::new_v4().to_string();
-            let record = UserRecord {
-                local_id: local_id.clone(),
-                email: email.clone(),
-                display_name: None,
-                photo_url: None,
-                phone_number: None,
-                custom_attributes: None,
-                disabled: false,
-                email_verified: false,
-                password_hash: None,
-                valid_since_secs: now_ms() / 1000,
-                mfa_info: Vec::new(),
-                providers: vec![ProviderRecord {
-                    provider_id: provider_id.clone(),
-                    raw_id: raw_id.clone(),
-                    email: email.clone(),
-                }],
-                created_at_ms: now_ms(),
-                last_login_at_ms: None,
-            };
-            project
-                .user_ids_by_provider
-                .insert((provider_id, raw_id), local_id.clone());
-            project
-                .user_ids_by_email
-                .entry(email.clone())
-                .or_insert_with(|| local_id.clone());
-            project.users_by_id.insert(local_id.clone(), record);
-            project
-                .users_by_id
-                .get_mut(&local_id)
-                .expect("inserted user")
+    let target = match resolve_idp_target(project, &profile, linking_claims)? {
+        Ok(target) => target,
+        Err(message) if payload.return_idp_credential.unwrap_or(false) => {
+            response["errorMessage"] = json!(message);
+            return Ok(response);
         }
+        Err(message) => return Err(error(StatusCode::BAD_REQUEST, message)),
     };
 
+    let mut is_new_user = false;
+    let local_id = match target {
+        IdpTarget::NeedConfirmation(local_id) => {
+            let verified_providers = project
+                .users_by_id
+                .get(&local_id)
+                .map(|record| {
+                    record
+                        .providers
+                        .iter()
+                        .filter(|provider| is_federated_provider(&provider.provider_id))
+                        .map(|provider| provider.provider_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            response["needConfirmation"] = json!(true);
+            response["localId"] = json!(local_id);
+            response["verifiedProvider"] = json!(verified_providers);
+            return Ok(response);
+        }
+        IdpTarget::New => {
+            is_new_user = true;
+            create_idp_user(project, &profile)
+        }
+        IdpTarget::Provider(local_id) => local_id,
+        IdpTarget::Link(local_id) => {
+            link_idp_email(project, &local_id, &profile);
+            local_id
+        }
+        IdpTarget::VerifiedEmail(local_id) => {
+            if adopt_verified_idp_email(project, &local_id, &profile) {
+                response["emailRecycled"] = json!(true);
+            }
+            local_id
+        }
+    };
+    upsert_idp_provider(project, &local_id, &profile);
+
+    let record = project
+        .users_by_id
+        .get_mut(&local_id)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+    if record.disabled {
+        return Err(error(StatusCode::BAD_REQUEST, "USER_DISABLED"));
+    }
+    if profile.email.as_deref() == Some(record.email.as_str()) {
+        response["emailVerified"] = json!(record.email_verified);
+    }
+    response["localId"] = json!(local_id);
+    response["isNewUser"] = json!(is_new_user);
+
+    if !record.mfa_info.is_empty() {
+        let mfa_info = record.mfa_info.clone();
+        let pending_credential = format!("firelite-mfa-pending-{}", Uuid::new_v4());
+        project.mfa_pending_credentials.insert(
+            pending_credential.clone(),
+            MfaPendingCredential {
+                local_id,
+                issued_at: now_secs(),
+            },
+        );
+        response["mfaPendingCredential"] = json!(pending_credential);
+        response["mfaInfo"] = json!(mfa_info);
+        return Ok(response);
+    }
+
     record.last_login_at_ms = Some(now_ms());
-    Ok(auth_response(
-        &project_id,
-        record,
-        payload.return_secure_token,
-    ))
+    if payload.return_secure_token.unwrap_or(true) {
+        response["idToken"] = json!(make_token_with_second_factor_and_claims(
+            &project_id,
+            record,
+            None,
+            None,
+            Some(&provider_id),
+        ));
+        response["refreshToken"] = json!(make_refresh_token(&project_id, &local_id));
+        response["expiresIn"] = json!("3600");
+    }
+    Ok(response)
 }
+
+/// Merges IdP parameters from the request URI query, `postBody`, and URI
+/// fragment, in that order of precedence (later wins), like the official
+/// emulator.
+fn idp_params(request_uri: Option<&str>, post_body: Option<&str>) -> HashMap<String, String> {
+    let request_uri = request_uri.unwrap_or_default();
+    let (without_fragment, fragment) = request_uri
+        .split_once('#')
+        .map_or((request_uri, None), |(uri, fragment)| (uri, Some(fragment)));
+    let mut params = HashMap::new();
+    if let Some((_, query)) = without_fragment.split_once('?') {
+        params.extend(parse_post_body(query));
+    }
+    if let Some(post_body) = post_body {
+        params.extend(parse_post_body(post_body));
+    }
+    if let Some(fragment) = fragment {
+        params.extend(parse_post_body(fragment));
+    }
+    params
+}
+
+fn idp_claims(
+    params: &HashMap<String, String>,
+    id_token: Option<&str>,
+    access_token: Option<&str>,
+) -> Result<serde_json::Map<String, serde_json::Value>, AuthError> {
+    for token in [id_token, access_token].into_iter().flatten() {
+        if let Some(claims) = parse_idp_token_claims(token)? {
+            return Ok(claims);
+        }
+    }
+    if id_token.is_some() {
+        return Err(error(StatusCode::BAD_REQUEST, "INVALID_IDP_RESPONSE"));
+    }
+
+    // Tolerant legacy form: an explicit raw ID (or opaque OAuth token) and an
+    // optional email in the post body.
+    let raw_id = params
+        .get("rawId")
+        .or_else(|| params.get("raw_id"))
+        .map(String::as_str)
+        .or(access_token)
+        .or_else(|| params.get("oauth_token").map(String::as_str))
+        .filter(|raw_id| !raw_id.is_empty())
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "INVALID_IDP_RESPONSE"))?;
+    let mut claims = serde_json::Map::new();
+    claims.insert("sub".to_string(), json!(raw_id));
+    if let Some(email) = params.get("email") {
+        claims.insert("email".to_string(), json!(email));
+    }
+    Ok(claims)
+}
+
+/// Parses a fake IdP token: strict JSON claims or an (unverified) JWT.
+/// Returns `None` for opaque tokens that are neither.
+fn parse_idp_token_claims(
+    token: &str,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, AuthError> {
+    let invalid = || error(StatusCode::BAD_REQUEST, "INVALID_IDP_RESPONSE");
+    let token = token.trim();
+    let value = if token.starts_with('{') {
+        serde_json::from_str::<serde_json::Value>(token).map_err(|_| invalid())?
+    } else {
+        let decoded = token
+            .split('.')
+            .nth(1)
+            .and_then(|payload| URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok())
+            .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok());
+        match decoded {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+    let serde_json::Value::Object(claims) = value else {
+        return Err(invalid());
+    };
+    match claims.get("sub") {
+        Some(serde_json::Value::String(sub)) if !sub.is_empty() => Ok(Some(claims)),
+        _ => Err(invalid()),
+    }
+}
+
+fn idp_profile(
+    provider_id: &str,
+    claims: &serde_json::Map<String, serde_json::Value>,
+) -> (IdpProfile, serde_json::Value) {
+    let string_claim = |name: &str| {
+        claims
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let raw_id = string_claim("sub").expect("IdP claims are validated to contain sub");
+    let email = string_claim("email").map(|email| normalize_email(&email));
+    let email_verified = match claims.get("email_verified") {
+        Some(serde_json::Value::Bool(verified)) => *verified,
+        Some(serde_json::Value::String(verified)) => verified == "true",
+        _ => false,
+    };
+    let display_name = string_claim("name");
+    let photo_url = string_claim("picture");
+    let screen_name = string_claim("screen_name");
+
+    let mut response = json!({
+        "kind": "identitytoolkit#VerifyAssertionResponse",
+        "context": "",
+        "providerId": provider_id,
+        "emailVerified": email_verified,
+    });
+    let (federated_id, raw_user_info) = if provider_id == "google.com" {
+        let given_name = string_claim("given_name");
+        let family_name = string_claim("family_name");
+        let mut granted_scopes =
+            "openid https://www.googleapis.com/auth/userinfo.profile".to_string();
+        if email.is_some() {
+            granted_scopes.push_str(" https://www.googleapis.com/auth/userinfo.email");
+        }
+        let raw_user_info = json!({
+            "granted_scopes": granted_scopes,
+            "id": raw_id,
+            "name": display_name,
+            "given_name": given_name,
+            "family_name": family_name,
+            "verified_email": email_verified,
+            "locale": "en",
+            "email": email,
+            "picture": photo_url,
+        });
+        if let Some(given_name) = given_name {
+            response["firstName"] = json!(given_name);
+        }
+        if let Some(family_name) = family_name {
+            response["lastName"] = json!(family_name);
+        }
+        (
+            format!("https://accounts.google.com/{raw_id}"),
+            raw_user_info,
+        )
+    } else {
+        (raw_id.clone(), serde_json::Value::Object(claims.clone()))
+    };
+    response["federatedId"] = json!(federated_id);
+    response["rawUserInfo"] = json!(raw_user_info.to_string());
+    for (field, value) in [
+        ("displayName", &display_name),
+        ("fullName", &display_name),
+        ("screenName", &screen_name),
+        ("email", &email),
+        ("photoUrl", &photo_url),
+    ] {
+        if let Some(value) = value {
+            response[field] = json!(value);
+        }
+    }
+
+    let profile = IdpProfile {
+        provider_id: provider_id.to_string(),
+        raw_id,
+        email,
+        email_verified,
+        display_name,
+        photo_url,
+    };
+    (profile, response)
+}
+
+/// Picks the account an IdP sign-in applies to. The outer error is a hard
+/// failure; the inner error is a conflict that `returnIdpCredential` callers
+/// receive as `errorMessage` instead.
+fn resolve_idp_target(
+    project: &ProjectAuthState,
+    profile: &IdpProfile,
+    linking_claims: Option<TokenClaims>,
+) -> Result<Result<IdpTarget, &'static str>, AuthError> {
+    let existing = |local_id: Option<&String>| {
+        local_id
+            .filter(|local_id| project.users_by_id.contains_key(*local_id))
+            .cloned()
+    };
+    let user_matching_provider = existing(
+        project
+            .user_ids_by_provider
+            .get(&(profile.provider_id.clone(), profile.raw_id.clone())),
+    );
+    let user_matching_email = existing(
+        profile
+            .email
+            .as_ref()
+            .and_then(|email| project.user_ids_by_email.get(email)),
+    );
+
+    if let Some(claims) = linking_claims {
+        let record = project
+            .users_by_id
+            .get(&claims.local_id)
+            .ok_or_else(|| error(StatusCode::BAD_REQUEST, "USER_NOT_FOUND"))?;
+        if claims.issued_at < record.valid_since_secs {
+            return Err(error(StatusCode::BAD_REQUEST, "TOKEN_EXPIRED"));
+        }
+        if user_matching_provider.is_some() {
+            return Ok(Err("FEDERATED_USER_ID_ALREADY_LINKED"));
+        }
+        if user_matching_email.is_some_and(|local_id| local_id != claims.local_id) {
+            return Ok(Err("EMAIL_EXISTS"));
+        }
+        return Ok(Ok(IdpTarget::Link(claims.local_id)));
+    }
+    Ok(Ok(match (user_matching_provider, user_matching_email) {
+        (Some(local_id), _) => IdpTarget::Provider(local_id),
+        (None, Some(local_id)) if profile.email_verified => IdpTarget::VerifiedEmail(local_id),
+        (None, Some(local_id)) => IdpTarget::NeedConfirmation(local_id),
+        (None, None) => IdpTarget::New,
+    }))
+}
+
+fn create_idp_user(project: &mut ProjectAuthState, profile: &IdpProfile) -> String {
+    let local_id = Uuid::new_v4().to_string();
+    let now = now_ms();
+    let email = profile.email.clone().unwrap_or_default();
+    if !email.is_empty() {
+        project
+            .user_ids_by_email
+            .insert(email.clone(), local_id.clone());
+    }
+    project.users_by_id.insert(
+        local_id.clone(),
+        UserRecord {
+            local_id: local_id.clone(),
+            email_verified: !email.is_empty() && profile.email_verified,
+            email,
+            display_name: profile.display_name.clone(),
+            photo_url: profile.photo_url.clone(),
+            phone_number: None,
+            custom_attributes: None,
+            disabled: false,
+            password_hash: None,
+            valid_since_secs: now / 1000,
+            mfa_info: Vec::new(),
+            providers: Vec::new(),
+            created_at_ms: now,
+            last_login_at_ms: None,
+        },
+    );
+    local_id
+}
+
+/// Adopts the IdP email for a user linking a provider.
+fn link_idp_email(project: &mut ProjectAuthState, local_id: &str, profile: &IdpProfile) {
+    let Some(record) = project.users_by_id.get_mut(local_id) else {
+        return;
+    };
+    let Some(email) = &profile.email else {
+        return;
+    };
+    if record.email.is_empty() {
+        record.email = email.clone();
+        record.email_verified = profile.email_verified;
+        project
+            .user_ids_by_email
+            .insert(email.clone(), local_id.to_string());
+    } else if &record.email == email && profile.email_verified {
+        record.email_verified = true;
+    }
+}
+
+/// Signs a trusted-IdP user into the existing account with the same email.
+/// An account whose email was never verified is taken over: its password,
+/// phone number, other providers, and sessions are dropped, as in production.
+/// Returns whether the email was recycled from another identity of the same
+/// provider.
+fn adopt_verified_idp_email(
+    project: &mut ProjectAuthState,
+    local_id: &str,
+    profile: &IdpProfile,
+) -> bool {
+    let Some(record) = project.users_by_id.get_mut(local_id) else {
+        return false;
+    };
+    let email_recycled = record.providers.iter().any(|provider| {
+        provider.provider_id == profile.provider_id && provider.raw_id != profile.raw_id
+    });
+    if !record.email_verified {
+        record.password_hash = None;
+        if let Some(phone_number) = record.phone_number.take() {
+            project.user_ids_by_phone.remove(&phone_number);
+        }
+        record.valid_since_secs = now_secs();
+        for provider in record.providers.drain(..) {
+            project
+                .user_ids_by_provider
+                .remove(&(provider.provider_id, provider.raw_id));
+        }
+    }
+    if profile.display_name.is_some() {
+        record.display_name = profile.display_name.clone();
+    }
+    if profile.photo_url.is_some() {
+        record.photo_url = profile.photo_url.clone();
+    }
+    record.email_verified = true;
+    email_recycled
+}
+
+fn upsert_idp_provider(project: &mut ProjectAuthState, local_id: &str, profile: &IdpProfile) {
+    let Some(record) = project.users_by_id.get_mut(local_id) else {
+        return;
+    };
+    let mut provider = ProviderRecord {
+        provider_id: profile.provider_id.clone(),
+        raw_id: profile.raw_id.clone(),
+        email: profile.email.clone().unwrap_or_default(),
+        display_name: profile.display_name.clone(),
+        photo_url: profile.photo_url.clone(),
+    };
+    match record
+        .providers
+        .iter_mut()
+        .find(|existing| existing.provider_id == profile.provider_id)
+    {
+        Some(existing) => {
+            if existing.raw_id == profile.raw_id {
+                // Credentials that omit profile claims keep what we already know.
+                provider.display_name = provider.display_name.or(existing.display_name.take());
+                provider.photo_url = provider.photo_url.or(existing.photo_url.take());
+                if provider.email.is_empty() {
+                    provider.email = std::mem::take(&mut existing.email);
+                }
+            } else {
+                project
+                    .user_ids_by_provider
+                    .remove(&(existing.provider_id.clone(), existing.raw_id.clone()));
+            }
+            *existing = provider;
+        }
+        None => record.providers.push(provider),
+    }
+    project.user_ids_by_provider.insert(
+        (profile.provider_id.clone(), profile.raw_id.clone()),
+        local_id.to_string(),
+    );
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdpWidgetQuery {
+    api_key: Option<String>,
+    provider_id: Option<String>,
+}
+
+/// Fake IdP sign-in page the Firebase JS SDK opens for `signInWithPopup` and
+/// `signInWithRedirect` when connected to the Auth emulator.
+async fn idp_widget(
+    State(state): State<SharedState>,
+    Query(query): Query<IdpWidgetQuery>,
+) -> Response {
+    let (Some(_), Some(provider_id)) = (query.api_key, query.provider_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "authEmulator": {
+                    "error": "missing apiKey or providerId query parameters",
+                },
+            })),
+        )
+            .into_response();
+    };
+    let mut accounts = {
+        let projects = state.auth.projects.read().expect("auth state poisoned");
+        projects
+            .get(state.auth.default_project_id())
+            .map(|project| {
+                project
+                    .users_by_id
+                    .values()
+                    .filter_map(|user| {
+                        let provider = user
+                            .providers
+                            .iter()
+                            .find(|provider| provider.provider_id == provider_id)?;
+                        let email = Some(provider.email.as_str())
+                            .filter(|email| !email.is_empty())
+                            .or((!user.email.is_empty()).then_some(user.email.as_str()))
+                            .map(ToOwned::to_owned);
+                        Some(IdpWidgetAccount {
+                            raw_id: provider.raw_id.clone(),
+                            email,
+                            display_name: provider
+                                .display_name
+                                .clone()
+                                .or_else(|| user.display_name.clone()),
+                            photo_url: provider
+                                .photo_url
+                                .clone()
+                                .or_else(|| user.photo_url.clone()),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    accounts.sort_by(|left, right| {
+        (&left.email, &left.display_name, &left.raw_id).cmp(&(
+            &right.email,
+            &right.display_name,
+            &right.raw_id,
+        ))
+    });
+    Html(render_idp_widget(&provider_id, &accounts)).into_response()
+}
+
+async fn idp_iframe() -> Html<&'static str> {
+    Html(IDP_IFRAME_HTML)
+}
+
+struct IdpWidgetAccount {
+    raw_id: String,
+    email: Option<String>,
+    display_name: Option<String>,
+    photo_url: Option<String>,
+}
+
+fn render_idp_widget(provider_id: &str, accounts: &[IdpWidgetAccount]) -> String {
+    let accounts_html = if accounts.is_empty() {
+        format!(
+            r#"<p class="empty">No {} accounts exist in the Firelite Auth emulator yet.</p>"#,
+            escape_html(provider_id)
+        )
+    } else {
+        let items = accounts
+            .iter()
+            .map(|account| {
+                let claims = json!({
+                    "sub": account.raw_id,
+                    "iss": "",
+                    "aud": "",
+                    "exp": 0,
+                    "iat": 0,
+                    "name": account.display_name,
+                    "email": account.email,
+                    "email_verified": true,
+                    "picture": account.photo_url,
+                });
+                let label = account
+                    .display_name
+                    .as_deref()
+                    .unwrap_or("(No display name)");
+                let initial = label
+                    .chars()
+                    .find(|character| character.is_alphanumeric())
+                    .map(|character| character.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let avatar = match &account.photo_url {
+                    Some(photo_url) => format!(
+                        r#"<img class="avatar" alt="" src="{}">"#,
+                        escape_html(photo_url)
+                    ),
+                    None => format!(
+                        r#"<span class="avatar" aria-hidden="true">{}</span>"#,
+                        escape_html(&initial)
+                    ),
+                };
+                format!(
+                    r#"<li><button type="button" class="account js-reuse-account" data-id-token="{token}" data-email="{email}">{avatar}<span class="account-text"><span class="account-name">{label}</span><span class="account-email">{email}</span></span></button></li>"#,
+                    token = escape_html(&percent_encode_query(&claims.to_string())),
+                    email = escape_html(account.email.as_deref().unwrap_or_default()),
+                    label = escape_html(label),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(r#"<ul class="accounts">{items}</ul>"#)
+    };
+    IDP_WIDGET_HTML
+        .replace("{{PROVIDER_ID}}", &escape_html(provider_id))
+        .replace("{{ACCOUNTS}}", &accounts_html)
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+const IDP_WIDGET_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in with {{PROVIDER_ID}} · Firelite Auth emulator</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f7f9; --card: #fff; --text: #1d2025; --muted: #646b75; --line: #dde1e6; --accent: #1a73e8; --hover: #eef3fd; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #15171a; --card: #1e2125; --text: #e8eaed; --muted: #9aa0a6; --line: #34383d; --accent: #8ab4f8; --hover: #263042; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; justify-content: center; padding: 32px 16px; }
+  main { width: 100%; max-width: 440px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 24px; align-self: flex-start; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); margin: 0 0 16px; }
+  .accounts { list-style: none; margin: 0 0 12px; padding: 0; border-top: 1px solid var(--line); }
+  .accounts li { border-bottom: 1px solid var(--line); }
+  .account { display: flex; gap: 12px; align-items: center; width: 100%; padding: 10px 8px; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .account:hover, .account:focus-visible { background: var(--hover); outline: none; }
+  .avatar { flex: none; width: 36px; height: 36px; border-radius: 50%; object-fit: cover; display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: var(--card); font-weight: 600; }
+  .account-text { display: flex; flex-direction: column; min-width: 0; }
+  .account-name, .account-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .account-email { color: var(--muted); font-size: 13px; }
+  .empty { color: var(--muted); }
+  button.primary, button.secondary { font: inherit; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--card); border: 1px solid var(--accent); font-weight: 600; }
+  button.secondary { background: none; color: var(--accent); border: 1px solid var(--line); }
+  form { display: none; flex-direction: column; gap: 12px; }
+  form.open { display: flex; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  input[aria-invalid="true"] { border-color: #d93025; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; }
+  .actions > div { display: flex; gap: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sign in with {{PROVIDER_ID}}</h1>
+  <p class="subtitle">Firelite Auth emulator: fake accounts only, no real {{PROVIDER_ID}} sign-in happens here.</p>
+  <section class="js-accounts">
+    {{ACCOUNTS}}
+    <button type="button" class="secondary js-new-account">+ Add new account</button>
+  </section>
+  <form class="js-form" novalidate>
+    <label>Email
+      <input type="email" name="email" autocomplete="off" required>
+    </label>
+    <label>Display name (optional)
+      <input type="text" name="displayName" autocomplete="off">
+    </label>
+    <label>Profile photo URL (optional)
+      <input type="url" name="photoUrl" autocomplete="off">
+    </label>
+    <div class="actions">
+      <button type="button" class="secondary js-autogen">Auto-generate</button>
+      <div>
+        <button type="button" class="secondary js-back">Back</button>
+        <button type="submit" class="primary">Sign in</button>
+      </div>
+    </div>
+  </form>
+</main>
+<script>
+  function fail(message) {
+    document.body.textContent = 'Firelite Auth emulator error: ' + message;
+    document.body.style.cssText = 'color:#d93025;white-space:pre-wrap;padding:16px;font-family:monospace';
+    throw new Error(message);
+  }
+
+  var query = new URLSearchParams(location.search);
+  if (query.get('error')) fail(query.get('error'));
+  var apiKey = query.get('apiKey');
+  var appName = query.get('appName');
+  var tenantId = query.get('tid');
+  var authType = query.get('authType');
+  var providerId = query.get('providerId');
+  var redirectUrl = query.get('redirectUrl');
+  var eventId = query.get('eventId');
+  var storageKey = apiKey + ':' + appName;
+  if (!appName) fail('Missing the appName query parameter. Firelite supports the web SDK popup and redirect flows only.');
+
+  function saveAuthEvent(authEvent) {
+    if (/popup/i.test(authType)) {
+      sendAuthEventViaIframeRelay(authEvent);
+    } else if (redirectUrl) {
+      sessionStorage['firebase:redirectEvent:' + storageKey] = JSON.stringify(authEvent);
+      window.location = redirectUrl;
+    } else {
+      fail('Missing redirectUrl. Use signInWithCredential for this platform instead.');
+    }
+  }
+
+  function sendAuthEventViaIframeRelay(authEvent) {
+    var sent = false;
+    if (window.opener) {
+      for (var i = 0; i < window.opener.frames.length; i++) {
+        try {
+          var frame = window.opener.frames[i];
+          var frameQuery = new URLSearchParams(frame.location.search);
+          if (frameQuery.get('apiKey') === apiKey && frameQuery.get('appName') === appName) {
+            frame.postMessage({
+              data: { authEvent: authEvent, storageKey: storageKey },
+              eventId: Math.floor(Math.random() * Math.pow(10, 20)).toString(),
+              eventType: 'sendAuthEvent'
+            }, '*');
+            sent = true;
+          }
+        } catch (_) {
+          // Frames from other origins throw; skip them.
+        }
+      }
+    }
+    if (!sent) fail('Could not find the Auth emulator helper iframe in the opener window.');
+  }
+
+  function finishWithUser(urlEncodedIdToken) {
+    var url = window.location.href.split('?')[0] +
+      '?providerId=' + encodeURIComponent(providerId) +
+      '&id_token=' + urlEncodedIdToken;
+    saveAuthEvent({
+      type: authType,
+      eventId: eventId,
+      urlResponse: url,
+      sessionId: 'ValueNotUsedByAuthEmulator',
+      postBody: '',
+      tenantId: tenantId,
+      error: null
+    });
+  }
+
+  document.querySelectorAll('.js-reuse-account').forEach(function (button) {
+    button.addEventListener('click', function () {
+      finishWithUser(button.dataset.idToken);
+    });
+  });
+
+  var form = document.querySelector('.js-form');
+  var accounts = document.querySelector('.js-accounts');
+  function toggleForm(open) {
+    form.classList.toggle('open', open);
+    accounts.hidden = open;
+    if (open) form.elements.email.focus();
+  }
+  document.querySelector('.js-new-account').addEventListener('click', function () { toggleForm(true); });
+  document.querySelector('.js-back').addEventListener('click', function () { toggleForm(false); });
+
+  function randomDigits(length) {
+    var digits = '';
+    for (var i = 0; i < length; i++) digits += Math.floor(Math.random() * 10).toString();
+    return digits;
+  }
+
+  var adjectives = ['amber', 'brisk', 'calm', 'dusky', 'eager', 'fuzzy', 'gentle', 'hazel', 'jolly', 'lucky'];
+  var animals = ['otter', 'falcon', 'lynx', 'heron', 'badger', 'gecko', 'panda', 'koala', 'raven', 'tapir'];
+  document.querySelector('.js-autogen').addEventListener('click', function () {
+    var adjective = adjectives[Math.floor(Math.random() * adjectives.length)];
+    var animal = animals[Math.floor(Math.random() * animals.length)];
+    form.elements.displayName.value = adjective[0].toUpperCase() + adjective.slice(1) + ' ' + animal[0].toUpperCase() + animal.slice(1);
+    form.elements.email.value = adjective + '.' + animal + '.' + randomDigits(3) + '@example.com';
+    form.elements.email.removeAttribute('aria-invalid');
+  });
+
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    var email = form.elements.email.value.trim();
+    if (!/^[^@\s]+@[^@\s]+$/.test(email)) {
+      form.elements.email.setAttribute('aria-invalid', 'true');
+      form.elements.email.focus();
+      return;
+    }
+    var claims = {
+      sub: randomDigits(21),
+      iss: '',
+      aud: '',
+      exp: 0,
+      iat: 0,
+      email: email,
+      email_verified: true
+    };
+    if (form.elements.displayName.value.trim()) claims.name = form.elements.displayName.value.trim();
+    if (form.elements.photoUrl.value.trim()) claims.picture = form.elements.photoUrl.value.trim();
+    finishWithUser(encodeURIComponent(JSON.stringify(claims)));
+  });
+</script>
+</body>
+</html>
+"#;
+
+/// Helper iframe the Firebase JS SDK embeds to receive popup and redirect
+/// results from the emulator widget. It speaks the `gapi.iframes` protocol the
+/// SDK expects, so it loads `gapi` from apis.google.com like the official
+/// emulator does.
+const IDP_IFRAME_HTML: &str = r#"<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Firelite Auth emulator helper iframe</title>
+<script>
+  var query = new URLSearchParams(location.search);
+  var apiKey = query.get('apiKey');
+  var appName = query.get('appName');
+  if (!apiKey || !appName) {
+    console.error('Firelite Auth emulator: missing apiKey or appName for the helper iframe.');
+  }
+  var storageKey = apiKey + ':' + appName;
+  var redirectEventKey = 'firebase:redirectEvent:' + storageKey;
+  var parentContainer = null;
+
+  window.addEventListener('message', function (event) {
+    if (typeof event.data !== 'object' || !event.data || event.data.eventType !== 'sendAuthEvent') {
+      return;
+    }
+    if (event.data.data.storageKey !== storageKey) {
+      return console.error('Firelite Auth emulator: auth event storage key mismatch.');
+    }
+    var authEvent = event.data.data.authEvent;
+    if (parentContainer) {
+      sendAuthEvent(authEvent);
+    } else {
+      // initFrameMessaging() picks this up once gapi has loaded.
+      sessionStorage[redirectEventKey] = JSON.stringify(authEvent);
+    }
+  });
+
+  function initFrameMessaging() {
+    parentContainer = gapi.iframes.getContext().getParentIframe();
+    parentContainer.register('webStorageSupport', function () {
+      // The SDK waits for this reply before continuing the popup flow.
+      return { status: 'ACK', webStorageSupport: true };
+    }, gapi.iframes.CROSS_ORIGIN_IFRAMES_FILTER);
+
+    var authEvent = null;
+    var storedEvent = sessionStorage[redirectEventKey];
+    if (storedEvent) {
+      try {
+        authEvent = JSON.parse(storedEvent);
+      } catch (_) {
+        console.error('Firelite Auth emulator: invalid stored auth event.');
+      }
+    }
+    sendAuthEvent(authEvent);
+    delete sessionStorage[redirectEventKey];
+  }
+
+  function sendAuthEvent(authEvent) {
+    parentContainer.send('authEvent', {
+      type: 'authEvent',
+      authEvent: authEvent || { type: 'unknown', error: { code: 'auth/no-auth-event' } }
+    }, function (responses) {
+      if (!responses || !responses.length || responses[responses.length - 1].status !== 'ACK') {
+        console.error('Firelite Auth emulator: sending the auth event failed.');
+      }
+    }, gapi.iframes.CROSS_ORIGIN_IFRAMES_FILTER);
+  }
+
+  window.gapi_onload = function () {
+    gapi.load('gapi.iframes', {
+      callback: initFrameMessaging,
+      timeout: 10000,
+      ontimeout: function () {
+        console.error('Firelite Auth emulator: timed out loading gapi.iframes. Check your internet connection.');
+      }
+    });
+  };
+</script>
+<script src="https://apis.google.com/js/api.js"></script>
+"#;
 
 fn send_oob_code(
     state: &SharedState,
@@ -2226,6 +3078,7 @@ fn get_or_create_user<'a>(
             provider_id: provider_id.to_string(),
             raw_id: raw_id.to_string(),
             email: email.clone(),
+            ..Default::default()
         }],
         created_at_ms: now_ms(),
         last_login_at_ms: None,
@@ -2417,19 +3270,6 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn sanitize_email_part(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn auth_response(
     project_id: &str,
     record: &UserRecord,
@@ -2600,6 +3440,18 @@ fn make_token_with_second_factor_and_claims(
             }
         }
     }
+    for provider in &record.providers {
+        if is_federated_provider(&provider.provider_id) {
+            payload["firebase"]["identities"][provider.provider_id.as_str()] =
+                json!([provider.raw_id]);
+        }
+    }
+    if let Some(display_name) = &record.display_name {
+        payload["name"] = json!(display_name);
+    }
+    if let Some(photo_url) = &record.photo_url {
+        payload["picture"] = json!(photo_url);
+    }
     if let Some((factor, identifier)) = second_factor {
         payload["firebase"]["sign_in_second_factor"] = json!(factor);
         payload["firebase"]["second_factor_identifier"] = json!(identifier);
@@ -2713,6 +3565,7 @@ fn upsert_phone_provider(record: &mut UserRecord, phone_number: &str) {
         provider_id: "phone".to_string(),
         raw_id: phone_number.to_string(),
         email: String::new(),
+        ..Default::default()
     });
 }
 
@@ -2840,6 +3693,10 @@ impl From<&UserRecord> for EmulatorUser {
                     provider_id: provider.provider_id.clone(),
                     raw_id: provider.raw_id.clone(),
                     email: provider.email.clone(),
+                    federated_id: is_federated_provider(&provider.provider_id)
+                        .then(|| provider.raw_id.clone()),
+                    display_name: provider.display_name.clone(),
+                    photo_url: provider.photo_url.clone(),
                 })
                 .collect(),
             mfa_info: record.mfa_info.clone(),

@@ -17,14 +17,15 @@ This tracks the `firebase/auth` client APIs used by a reference consumer applica
 | --- | --- | --- | --- |
 | `getAuth` | Client initialization only | implemented | No server endpoint required. |
 | `connectAuthEmulator` | Emulator host wiring | implemented | Existing daemon serves Identity Toolkit-style Auth paths. |
-| `GoogleAuthProvider` | Provider metadata for `signInWithPopup` | implemented | Covered by tolerant `accounts:signInWithIdp` provider/raw ID contract; official fixture capture still needed. |
-| `OAuthProvider` | Generic OAuth provider metadata for `signInWithPopup` | implemented | Covered by tolerant `accounts:signInWithIdp`; Microsoft-specific fixture capture still needed. |
+| `GoogleAuthProvider` | `accounts:signInWithIdp` with `providerId=google.com` | implemented | `GoogleAuthProvider.credential` accepts fake claims as JSON or an unsigned JWT; responses carry Google `federatedId`, `rawUserInfo`, and profile fields. Covered by contract tests and the Firebase Web SDK harness. |
+| `OAuthProvider` | Generic OAuth provider metadata for `signInWithPopup` | implemented | Uses the same `accounts:signInWithIdp` claims flow, with raw claims as `rawUserInfo`; Microsoft-specific fixture capture still needed. |
 | `signInWithEmailAndPassword` | `accounts:signInWithPassword` | implemented | Covered by current password sign-in contract tests. |
 | `signInWithEmailLink` | `accounts:signInWithEmailLink` after OOB code generation | implemented | In-memory single-use OOB code flow; official fixture capture still needed. |
 | `isSignInWithEmailLink` | Client URL parsing helper | no server endpoint | Track only to understand email-link workflow assumptions. |
 | `sendSignInLinkToEmail` | `accounts:sendOobCode` with `EMAIL_SIGNIN` | implemented | Returns `oobCode` directly and exposes `/emulator/v1/projects/{project}/oobCodes` for local inspection. |
 | `sendEmailVerification` / `applyActionCode` | `accounts:sendOobCode` with `VERIFY_EMAIL`, then `accounts:update` | implemented | Generates a single-use OOB code, marks the user verified when applied or when the emulator action link is opened, and prints that link to the console. |
-| `signInWithPopup` | IdP sign-in flow via `accounts:signInWithIdp` | implemented | Supports provider ID, raw ID, and email from `postBody`; popup UI behavior still needs SDK/browser discovery. |
+| `signInWithPopup` / `signInWithRedirect` | `/emulator/auth/handler` account picker, `/emulator/auth/iframe` relay, then `accounts:signInWithIdp` | implemented | Checked by hand in Chrome with the Firebase Web SDK. The relay iframe loads `gapi` from apis.google.com. Redirect needs the app and emulator on the same site. |
+| `signInWithCredential` / `linkWithCredential` (IdP) | `accounts:signInWithIdp` with optional `idToken` | implemented | Linking rejects identities already linked elsewhere (`FEDERATED_USER_ID_ALREADY_LINKED`) and emails owned by another user (`EMAIL_EXISTS`). |
 | `signInWithCustomToken` | `accounts:signInWithCustomToken` | implemented | Accepts unsigned local JWT-like tokens or plain local IDs for tests. |
 | `PhoneAuthProvider.verifyPhoneNumber` | `accounts:sendVerificationCode` and `accounts:signInWithPhoneNumber` | implemented | Generates inspectable, single-use SMS codes exposed by `/emulator/v1/projects/{project}/verificationCodes` and printed to the console. |
 | `updatePhoneNumber` | `accounts:update` with `phoneVerificationInfo` | implemented | Links the verified phone to the ID token's existing user without replacing its identity or claims. |

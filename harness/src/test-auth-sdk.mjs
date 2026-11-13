@@ -8,11 +8,15 @@ import {
   applyActionCode,
   connectAuthEmulator,
   createUserWithEmailAndPassword,
+  getAdditionalUserInfo,
   getAuth,
+  GoogleAuthProvider,
   isSignInWithEmailLink,
+  linkWithCredential,
   getMultiFactorResolver,
   sendEmailVerification,
   sendSignInLinkToEmail,
+  signInWithCredential,
   signInWithCustomToken,
   signInAnonymously,
   signInWithEmailAndPassword,
@@ -56,6 +60,7 @@ try {
   await testAnonymousFlow(auth);
   await testPhoneMfaFlow(auth, baseUrl);
   await testCustomTokenFlow(auth);
+  await testGoogleCredentialFlow(auth);
   await testEmailVerificationFlow(auth, baseUrl);
   await testEmailLinkFlow(auth, baseUrl);
 
@@ -184,6 +189,110 @@ async function testCustomTokenFlow(auth) {
   );
   assert.equal(credential.user.uid, "sdk-custom-token-user");
   assert.equal(credential.user.email, "sdk-custom-token-user@custom-token.local");
+}
+
+async function testGoogleCredentialFlow(auth) {
+  await signOut(auth);
+  const googleIdToken = JSON.stringify({
+    sub: "sdk-google-user",
+    email: "sdk-google@example.test",
+    email_verified: true,
+    name: "SDK Google User",
+    picture: "https://example.test/sdk-google.png"
+  });
+  const result = await signInWithCredential(
+    auth,
+    GoogleAuthProvider.credential(googleIdToken)
+  );
+  assert.equal(result.user.email, "sdk-google@example.test");
+  assert.equal(result.user.emailVerified, true);
+  assert.equal(result.user.displayName, "SDK Google User");
+  assert.equal(result.user.photoURL, "https://example.test/sdk-google.png");
+  assert.equal(result.providerId, "google.com");
+  assert.equal(result.user.providerData.length, 1);
+  assert.equal(result.user.providerData[0].providerId, "google.com");
+  assert.equal(result.user.providerData[0].uid, "sdk-google-user");
+  const additionalInfo = getAdditionalUserInfo(result);
+  assert.equal(additionalInfo.isNewUser, true);
+  assert.equal(additionalInfo.providerId, "google.com");
+  assert.equal(additionalInfo.profile.email, "sdk-google@example.test");
+  const credential = GoogleAuthProvider.credentialFromResult(result);
+  assert.equal(credential.idToken, googleIdToken);
+  const tokenResult = await result.user.getIdTokenResult();
+  assert.equal(tokenResult.signInProvider, "google.com");
+  assert.deepEqual(tokenResult.claims.firebase.identities["google.com"], ["sdk-google-user"]);
+
+  await signOut(auth);
+  const repeated = await signInWithCredential(
+    auth,
+    GoogleAuthProvider.credential(unsignedJwt({ sub: "sdk-google-user" }))
+  );
+  assert.equal(repeated.user.uid, result.user.uid);
+  assert.equal(getAdditionalUserInfo(repeated).isNewUser, false);
+
+  await signOut(auth);
+  const anonymous = await signInAnonymously(auth);
+  const linked = await linkWithCredential(
+    anonymous.user,
+    GoogleAuthProvider.credential(
+      JSON.stringify({
+        sub: "sdk-google-linked",
+        email: "sdk-google-linked@example.test",
+        email_verified: true
+      })
+    )
+  );
+  assert.equal(linked.user.uid, anonymous.user.uid);
+  assert.equal(linked.user.isAnonymous, false);
+  assert.equal(linked.user.email, "sdk-google-linked@example.test");
+  assert.deepEqual(
+    linked.user.providerData.map((provider) => provider.providerId),
+    ["google.com"]
+  );
+
+  await signOut(auth);
+  const passwordUser = await createUserWithEmailAndPassword(
+    auth,
+    "sdk-google-password@example.test",
+    "secret123"
+  );
+  const passwordLinked = await linkWithCredential(
+    passwordUser.user,
+    GoogleAuthProvider.credential(
+      JSON.stringify({
+        sub: "sdk-google-password",
+        email: "sdk-google-password@example.test",
+        email_verified: true
+      })
+    )
+  );
+  assert.equal(passwordLinked.user.uid, passwordUser.user.uid);
+  assert.deepEqual(
+    passwordLinked.user.providerData.map((provider) => provider.providerId).sort(),
+    ["google.com", "password"]
+  );
+  await signOut(auth);
+  const passwordAgain = await signInWithEmailAndPassword(
+    auth,
+    "sdk-google-password@example.test",
+    "secret123"
+  );
+  assert.equal(passwordAgain.user.uid, passwordUser.user.uid);
+  await signOut(auth);
+  const googleAgain = await signInWithCredential(
+    auth,
+    GoogleAuthProvider.credential(JSON.stringify({ sub: "sdk-google-password" }))
+  );
+  assert.equal(googleAgain.user.uid, passwordUser.user.uid);
+
+  await signOut(auth);
+  await assert.rejects(
+    signInWithCredential(
+      auth,
+      GoogleAuthProvider.credential(JSON.stringify({ email: "missing-sub@example.test" }))
+    ),
+    { code: "auth/invalid-credential" }
+  );
 }
 
 async function testEmailLinkFlow(auth, baseUrl) {
